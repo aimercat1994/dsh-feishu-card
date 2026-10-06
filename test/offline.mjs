@@ -1649,13 +1649,30 @@ async function main() {
     // diff finds nothing to announce. A plugin that only listens keeps serving the
     // old values while the page shows the new ones.
     const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
-    assert.match(indexSource, /resolveConfig\(ctx\.config \?\? config\)/)
     // ...so it reads the live config on every inbound message too, which makes no
     // notification load-bearing.
     assert.match(indexSource, /refreshSettings\('inbound message'\)/)
     // The settings service reports the document change on its own context, which is
     // a sibling of ours — only a root listener reaches it.
     assert.match(indexSource, /ctx\.root\.on\('settings\/document-updated'/)
+  })
+  await check('the plugin never reads ctx.config, which needs its own inject', async () => {
+    // Cordis throws `cannot get property "config" without inject` for a plugin that
+    // did not declare it — on the inbound path that killed EVERY message, with one
+    // log line and no reply. Comments may mention it; code may not.
+    const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
+    const code = indexSource
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+    assert.doesNotMatch(code, /ctx\.config/)
+  })
+  await check('re-reading settings cannot break message handling', async () => {
+    // It runs before the handler's own try, so an unguarded throw is every message
+    // dropped rather than one settings problem. The refresh must swallow and warn.
+    const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
+    const body = indexSource.slice(indexSource.indexOf('const refreshSettings'))
+    assert.match(body.slice(0, 900), /try \{/)
+    assert.match(body, /could not re-read settings; keeping the current values/)
   })
 
   // A volatile field does not validate into a plain value: the loader hands out a

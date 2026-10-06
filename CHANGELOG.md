@@ -444,6 +444,35 @@ resolveConfig(fiber.runtime, resolved);      // ← 先把新值解析进活配�
 
 ## 未完成
 
+
+### 修：读 `ctx.config` 需要 inject —— 它杀死了**每一条**消息
+
+上一步为了回读活配置，写了 `resolveConfig(ctx.config ?? config)`。用户在飞书发消息后**完全没有反应**，日志里一行：
+
+```
+ERROR [feishu-card] inbound message handler failed
+cannot get property "config" without inject
+    at refreshSettings (index.js:931:36)
+```
+
+Cordis 里 `ctx.config` **需要插件在 `inject` 里声明**才能访问；我的 `inject` 只有 `sessionController`，所以读取直接抛。
+
+两个错叠在一起才造成"完全没反应"：
+
+1. **读错了来源**。`apply(ctx, config)` 的 `config` 参数就是 loader 为 volatile 字段原地改写的那个对象，本来就不需要 `ctx.config`。已改回用它。
+2. **抛在了 try 之外**。`refreshSettings` 在 `onMessage` 的 try/catch **之前**调用，所以它一抛，**每条消息都死**，而且只留一行日志——用户看到的是彻底的沉默。已把整个函数体包进 try/catch：设置读不到只该降级，不该让消息处理崩掉。
+
+新增两条断言：① 源码（去掉注释后）**不得出现 `ctx.config`**——这正是本轮的回归；② `refreshSettings` 必须被 try 包住且带降级文案，因为它跑在消息处理路径上。
+
+**教训**：把新调用加到入站路径上时，第一件事是问"它抛了会怎样"。这里答案是"所有消息静默消失"。同时，`ctx.X` 在 Cordis 里不是随便可读的——**服务要声明**。
+
+断言 174 → 176。
+
+
+---
+
+## 未完成
+
 - `send_file` 拒绝路径的真实触发（实测时 agent 走了"复制进工作区再发"的路线）
 - `denyTools` 守卫与 `approvers` 的运行时实测（两处都需要一个能真实触发它们的场景）
 - `output: cot`（飞书原生思考消息）模式

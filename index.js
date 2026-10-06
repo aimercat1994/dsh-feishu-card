@@ -928,24 +928,37 @@ export async function apply(ctx, config = {}) {
    * @returns whether anything actually changed.
    */
   const refreshSettings = (why) => {
-    const next = resolveConfig(ctx.config ?? config)
-    // `cwd` here is the CONFIGURED value; the resolved workspace is ours to keep.
-    const candidate = { ...next, cwd: resolved.cwd }
-    if (JSON.stringify(candidate) === JSON.stringify(resolved)) return false
-    const previous = resolved
-    resolved = candidate
-    const changed = Object.keys(candidate)
-      .filter((key) => JSON.stringify(candidate[key]) !== JSON.stringify(previous[key]))
-    logger.info(`[feishu-card] settings applied live (${why}): ${changed.join(', ')}`)
-    if (next.appId !== previous.appId
-      || next.appSecret !== previous.appSecret
-      || next.domain !== previous.domain) {
-      // The long connection was opened with the previous app, so it must be rebuilt.
-      void reconnect()
-    } else if (next.cwd !== configuredCwd) {
-      void remountWorkspace(next.cwd)
+    // NEVER throws. This runs on the path that handles an inbound message, and a
+    // failure here is not a settings problem — it is every message being dropped.
+    // (It has already happened once: reading `ctx.config` without declaring it in
+    // `inject` throws, and that killed every message with one log line.)
+    try {
+      // The `config` argument, NOT `ctx.config`: Cordis throws
+      // "cannot get property \"config\" without inject" for a plugin that did not
+      // declare it, and the apply argument is the same object the loader mutates
+      // for volatile fields anyway.
+      const next = resolveConfig(config)
+      // `next.cwd` is the CONFIGURED value; the resolved workspace is ours to keep.
+      const candidate = { ...next, cwd: resolved.cwd }
+      if (JSON.stringify(candidate) === JSON.stringify(resolved)) return false
+      const previous = resolved
+      resolved = candidate
+      const changed = Object.keys(candidate)
+        .filter((key) => JSON.stringify(candidate[key]) !== JSON.stringify(previous[key]))
+      logger.info(`[feishu-card] settings applied live (${why}): ${changed.join(', ')}`)
+      if (next.appId !== previous.appId
+        || next.appSecret !== previous.appSecret
+        || next.domain !== previous.domain) {
+        // The long connection was opened with the previous app, so it must be rebuilt.
+        void reconnect()
+      } else if (next.cwd !== configuredCwd) {
+        void remountWorkspace(next.cwd)
+      }
+      return true
+    } catch (error) {
+      logger.warn('[feishu-card] could not re-read settings; keeping the current values', error)
+      return false
     }
-    return true
   }
 
   // External edits (the patch file, HMR) do announce themselves.

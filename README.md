@@ -102,6 +102,14 @@ github:aimercat1994/dsh-feishu-card
 
 装完**重启一次 Harness**（模块在启动时加载）。
 
+想锁定版本，用 release 标签（实测可用）：
+
+```
+github:aimercat1994/dsh-feishu-card#v0.1.0
+```
+
+当前版本 **v0.1.0** — [Release 说明](https://github.com/aimercat1994/dsh-feishu-card/releases/tag/v0.1.0) · [变更历史](CHANGELOG.md)
+
 ### 等价的命令行做法
 
 在 profile 目录里执行：

@@ -261,6 +261,18 @@ pnpm add github:aimercat1994/dsh-feishu-card
 
 **过程中的一个测量陷阱值得记**：我先用 `createRequire(<符号链接路径>)` 探测依赖，三个全报 `MODULE_NOT_FOUND`，差点得出"git 安装不带依赖"的错误结论。实际上 pnpm 把包放进 `.pnpm/` 虚拟存储、依赖只放在**真实路径**旁边，而 Node 解析会先 realpath——用符号链接路径做 CJS 探测是假阴性。改成直接 `import()` 一次就对了：模块加载成功，`FeishuTransport` 构造成功。
 
+### 发布 v0.1.0
+
+首个 release：https://github.com/aimercat1994/dsh-feishu-card/releases/tag/v0.1.0
+
+发布后逐项核对，而不是只看创建接口的返回：
+
+- tag `v0.1.0` → commit `a364752`，与本地 HEAD 一致
+- release tarball **匿名**可取（HTTP 200）——证明它确实公开
+- **锁定版本的安装规格实测可用**：`pnpm add github:aimercat1994/dsh-feishu-card#v0.1.0` 在隔离目录里装成功，`FeishuTransport` 构造正常
+
+Release 说明里专门列了「**未验证**」那一节（`denyTools` 运行时、`approvers`、`send_file` 拒绝路径、群聊作用域），因为开发过程中被"看起来在工作、其实没有"坑过三次——把没验证的说成验证过的，正是那种坑的成因。
+
 ---
 
 ## 未完成

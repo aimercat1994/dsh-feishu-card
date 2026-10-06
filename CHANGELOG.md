@@ -289,8 +289,42 @@ Release 说明里专门列了「**未验证**」那一节（`denyTools` 运行�
 
 断言 157 → 162。
 
+### 修：配置页永远停在「正在读取配置…」
+
+第一次实现挂在了**行级** slot（`plugins.row.config`，key `dsh-feishu-card#feishu-card`），并依赖 owner 传进来的 `form`。用户点进去后一直转圈。
+
+排查出**三个**独立问题，都从宿主源码读出来，不是猜的：
+
+**① 挂错了层级。** 本插件是单行 bundle，配置属于插件本身，该挂 `plugins.bundle.config`（按**包名**键控）。`plugins.row.config` 是给"多行 bundle 里的某一个组件"用的。参照实现 dsh-mnemon 正是两级都注册：bundle 级放插件设置，行级放各组件设置。
+
+**② bundle 级根本不传 `form`。** 两级的渲染调用不同：
+
+```js
+renderSlot("plugins.row.config",    { view: "page", form }, …)   // 行级：owner 给值
+renderSlot("plugins.bundle.config", { view: "page" }, …)         // bundle 级：只给 view
+```
+
+所以 bundle 级页面**必须自己取配置**——mnemon 用 `configurationServices()` / `ctx.configForms`；我之前依赖 `form` 就注定拿不到，而拿不到的表现恰好和"正在加载"一模一样。
+
+**③ 命名空间是裸 patch id，不是 loader 目录键。** 这个也钉死了：
+
+```js
+// dsh-tool-cordis/lib/types/config.js
+const { id, name } = entry.options;
+const listed = { id: entry.id, patchId: id, name };   // patchId = entry.options.id
+```
+
+而 `settings.describe()` 用 `entry.options.id`。所以命名空间是 `feishu-card`，`include:feishu-card` 只是 loader 目录键——**用错形式会什么都找不到，且没有任何报错**。
+
+**顺带把失败态拆开。** 原来三种完全不同的情况共用一句"正在读取配置…"：拿不到表单（命名空间没暴露）、`unavailable`（连接是 memory 模式）、`loading`（还没到）。现在各自有各自的文案——把"没有拿到表单"也显示成加载中，正是它让我第一轮没法从用户反馈里判断是哪种，白绕了一圈。
+
+断言 162 → 164（新增：bundle 级 + 包名 key、命名空间必须是裸 patch id、必须自取表单）。
+
+---
+
+## 未完成
+
 - `send_file` 拒绝路径的真实触发（实测时 agent 走了"复制进工作区再发"的路线）
-- `denyTools` 守卫与 `approvers` 的运行时实测
 - `denyTools` 守卫与 `approvers` 的运行时实测（两处都需要一个能真实触发它们的场景）
 - `output: cot`（飞书原生思考消息）模式
 - 多问题合并表单

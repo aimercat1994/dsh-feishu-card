@@ -28,7 +28,7 @@ import {
   settledDecisionElements,
 } from '../lib/card.js'
 import { TurnRenderer } from '../lib/turn.js'
-import { ConversationSessions, conversationKey, sessionIdFor } from '../lib/session.js'
+import { ConversationSessions, conversationKey, makeWorkspaceFiler, sessionIdFor } from '../lib/session.js'
 import { commandName, helpText, isCommandLine, runCommandLine } from '../lib/commands.js'
 import { describeCall, describeDiff, formatTokens, kindOf } from '../lib/present.js'
 import { REACTION, ReactionTracker } from '../lib/react.js'
@@ -993,6 +993,115 @@ async function main() {
       () => assertValidCard({ body: { elements: [{ tag: 'hr', element_id: 'footer-sep' }] } }, 'x'),
       /illegal element_id/,
     )
+  })
+
+  console.log('sessions are filed under their workspace')
+  await check('the create rung files the new session', async () => {
+    const filed = []
+    const s = new ConversationSessions({
+      sessionController: new FakeController(),
+      cwd: '/tmp',
+      onSession: async (id) => { filed.push(id) },
+    })
+    await s.reach('oc_file1')
+    assert.deepEqual(filed, ['feishu-oc_file1'])
+  })
+  await check('the resume rung files it too, repairing older sessions', async () => {
+    // A session created before this existed is already persisted, so only the
+    // resume rung can still put it in a group.
+    const controller = new FakeController()
+    controller.live.add('feishu-oc_file2')
+    const filed = []
+    const s = new ConversationSessions({
+      sessionController: controller,
+      cwd: '/tmp',
+      onSession: async (id) => { filed.push(id) },
+    })
+    await s.reach('oc_file2')
+    assert.deepEqual(filed, ['feishu-oc_file2'])
+    assert.deepEqual(controller.calls, ['resolve:feishu-oc_file2'], 'resumed, not created')
+  })
+  await check('a failing filer never blocks the conversation', async () => {
+    const s = new ConversationSessions({
+      sessionController: new FakeController(),
+      cwd: '/tmp',
+      onSession: async () => { throw new Error('registry down') },
+      logger: { warn: () => {} },
+    })
+    const agent = await s.reach('oc_file3')
+    assert.equal(agent.id, 'feishu-oc_file3')
+  })
+
+  console.log('workspace filer')
+  /** A registry whose behaviour the test controls. */
+  function registryHarness({ owned }) {
+    const calls = { resolve: 0, create: 0, attach: [] }
+    const workspace = { title: 'aimercat', attachSession: async (id) => { calls.attach.push(id) } }
+    const registry = {
+      resolveByPath: async () => { calls.resolve += 1; return owned ? workspace : undefined },
+      create: async () => { calls.create += 1; return workspace },
+    }
+    return { registry, calls }
+  }
+  await check('an existing workspace is reused, not created', async () => {
+    const h = registryHarness({ owned: true })
+    const filer = makeWorkspaceFiler({ get: () => h.registry }, '/w', undefined)
+    await filer('s1')
+    assert.equal(h.calls.create, 0)
+    assert.deepEqual(h.calls.attach, ['s1'])
+  })
+  await check('an unowned directory gets a workspace', async () => {
+    const h = registryHarness({ owned: false })
+    const filer = makeWorkspaceFiler({ get: () => h.registry }, '/w', undefined)
+    await filer('s1')
+    assert.equal(h.calls.create, 1)
+    assert.deepEqual(h.calls.attach, ['s1'])
+  })
+  await check('the workspace is resolved once and each session attached once', async () => {
+    const h = registryHarness({ owned: true })
+    const filer = makeWorkspaceFiler({ get: () => h.registry }, '/w', undefined)
+    await filer('s1')
+    await filer('s1')
+    await filer('s2')
+    assert.equal(h.calls.resolve, 1, 'the workspace lookup is cached')
+    assert.deepEqual(h.calls.attach, ['s1', 's2'])
+  })
+  await check('no workspace service means no crash, just no grouping', async () => {
+    const filer = makeWorkspaceFiler({ get: () => undefined }, '/w', undefined)
+    await filer('s1')
+  })
+  await check('an attach failure propagates to the ladder, which contains it', async () => {
+    const warned = []
+    const workspace = { title: 'x', attachSession: async () => { throw new Error('gone') } }
+    const filer = makeWorkspaceFiler(
+      { get: () => ({ resolveByPath: async () => workspace, create: async () => workspace }) },
+      '/w',
+      { warn: (...a) => warned.push(a) },
+    )
+    await assert.rejects(() => filer('s1'), /gone/)
+  })
+
+  await check('startup adopts known rotations but skips vanished sessions', async () => {
+    const tmp2 = await mkdtemp(join(tmpdir(), 'feishu-adopt-'))
+    const controller = new FakeController()
+    controller.inspect = async (id) => {
+      if (!controller.live.has(id)) throw new Error('unknown session')
+      return {}
+    }
+    const filed = []
+    const s = new ConversationSessions({
+      sessionController: controller,
+      cwd: '/tmp',
+      stateDir: tmp2,
+      onSession: async (id) => { filed.push(id) },
+    })
+    const gone = await s.rotate('oc_gone')   // never persisted
+    const here = await s.rotate('oc_here')   // persisted
+    controller.live.add(here)
+    await s.adoptExisting()
+    assert.deepEqual(filed, [here], 'only the session that still exists is filed')
+    assert.ok(!filed.includes(gone))
+    await rm(tmp2, { recursive: true, force: true })
   })
 
   console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)

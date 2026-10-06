@@ -14,7 +14,7 @@
 import { Config, hasCredentials, resolveConfig } from './lib/config.js'
 import { FeishuTransport, readCardAction, readInboundMessage } from './lib/feishu.js'
 import { TurnRenderer } from './lib/turn.js'
-import { ConversationSessions, conversationKey } from './lib/session.js'
+import { ConversationSessions, conversationKey, makeWorkspaceFiler } from './lib/session.js'
 import { CredentialStore, beginOnboarding, resolveStateDir } from './lib/onboarding.js'
 import { commandName, helpText, isCommandLine, runCommandLine, strings } from './lib/commands.js'
 import { createLogger } from './lib/log.js'
@@ -112,8 +112,11 @@ export async function apply(ctx, config = {}) {
     cwd: resolved.cwd,
     stateDir,
     logger,
+    onSession: makeWorkspaceFiler(ctx, resolved.cwd, logger),
   })
   await sessions.load()
+  // Group conversations that already exist, without waiting for their next message.
+  void sessions.adoptExisting().catch((error) => logger?.warn?.('[feishu-card] adopting existing sessions failed', error))
 
   const transport = new FeishuTransport({ appId: resolved.appId, appSecret: resolved.appSecret, domain: resolved.domain || undefined, logger })
   const renderer = new TurnRenderer({

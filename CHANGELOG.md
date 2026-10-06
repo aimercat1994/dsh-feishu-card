@@ -273,6 +273,8 @@ pnpm add github:aimercat1994/dsh-feishu-card
 
 Release 说明里专门列了「**未验证**」那一节（`denyTools` 运行时、`approvers`、`send_file` 拒绝路径、群聊作用域），因为开发过程中被"看起来在工作、其实没有"坑过三次——把没验证的说成验证过的，正是那种坑的成因。
 
+## 0.2.0
+
 ### 设置界面（插件管理页里的配置表单）
 
 用户要求在内置插件界面里配置本插件（默认工作区、飞书连接等）。
@@ -369,81 +371,11 @@ function volatileForm(schema) {
 
 **这一轮的两个教训**：① 该先读宿主**怎么决定显示什么**，再写显示什么；② 宿主的"可实时应用"配置不是值而是引用——文档里没有，但 `dsh-settings` 的 `plainConfig` 就是答案，找现成实现比读文档快。
 
-
----
-
-## 未完成
-
-
-### 修：入口组件只转发了 `form`，把 `configForms` 服务丢了
-
-volatile 修好之后仍然报"命名空间未暴露"。这次读了 `configForms` 的实现：
-
-```js
-get(entryId) {
-  const existing = this.forms.get(entryId);
-  if (existing !== void 0) return existing;
-  const form = new ConfigFormController(this.owner, { namespace: entryId }, …);
-  this.forms.set(entryId, form);
-  this.mirror.ensure();
-  return form;          // ← 永远返回一个表单，从不返回 undefined
-}
-```
-
-**它从不返回 `undefined`**，所以"命名空间未暴露"这个诊断本身是错的——真相是 `props.configForms` 是 `undefined`，于是我的 `resolveForm` 退到 `props.form`（bundle 级页面没有），最终返回 `undefined`。
-
-根因是我的入口组件：
-
-```js
-function FeishuCardConfig(props) {
-  if (props.view === 'summary') return h('span', …)
-  return h(ConfigPage, { form: props.form })   // ← 只手挑了一个字段转发
-}
-```
-
-slot 注入的服务是作为 **props** 到达入口组件的，手挑子集转发就会**静默丢掉其余的**——丢掉 `configForms` 正是这一处。改成转发整个 props 对象。
-
-**我那条断言也太弱**：它只断言源码里出现过 `configForms`（而它出现在 `resolveForm` 里，所以通过），没有断言这个服务真的流到了页面。现在断言入口必须是 `h(ConfigPage, props)`，且禁止手挑字段的写法。
-
-**教训**：诊断文案是我自己写的，它把"服务没传进来"说成了"宿主没暴露命名空间"——**一个错误的诊断比没有诊断更贵**，它让我去查宿主，而问题在我这边。文案应当只陈述观察到的事实（"没拿到表单"），不要替我推断原因。
-
-
----
-
-## 未完成
-
-
-### 修：设置页保存**不会**发 `loader/volatile-update`，所以"实时生效"没生效
-
-用户改了一个字号：写回**成功**（profile patch 里出现 `textSizes.reasoning: normal`），但插件日志里没有 `settings changed live`，插件也没重新挂载。也就是说值存下来了，**插件没看见**。
-
-查 `dsh-config-editor` 的 `edit()`：
-
-```js
-const resolved = fiber.ctx.waterfall(fiber, "internal/config", next, () => next);
-resolveConfig(fiber.runtime, resolved);      // ← 先把新值解析进活配置引用
-… await reconcileProfilePatches(root, patches, "dsh", [entry.options.id]);
-```
-
-它**先把新值直接写进运行时引用**，然后才去 reconcile。于是 loader 的 `_commitVolatile()` 再 diff 时发现"没有变化"，就**不发** `loader/volatile-update`。我监听的那个事件，从设置页保存时根本不会响。
-
-而我的 `resolved` 是挂载时**拷贝**出来的普通对象——引用被改了它不会变。**"实时生效"因此是假的**：页面显示新值，插件照旧用旧值。
-
-修法（不依赖任何通知）：
-
 - `refreshSettings()` 回读活配置（`resolveConfig(ctx.config ?? config)`），比较后只在**确实变化**时更新并记一行日志
 - 在**每条入站消息前**调用它——这样没有任何事件是承重的
 - 另外两个事件也接上：`loader/volatile-update`（外部改文件/HMR 会发）与 `settings/document-updated`（设置页会发；但它发在 settings 自己的 context 上，与我们是**兄弟**而非祖先，所以必须注册在 `ctx.root` 才听得到）
-
-顺带把命名空间抽成 `lib/config.js` 的 `SETTINGS_NAMESPACE`，与浏览器一半的常量一起被断言钉在 patch 行 id 上——两处各写一份字符串迟早会漂。
-
-**教训**：这次失败的形式是"保存成功了、值也存对了、日志里什么都没有"。**"看起来生效"和"真的生效"之间隔着一次回读**；凡是靠事件驱动的实时性，都要先确认那个事件真的会发。
-
-
----
-
-## 未完成
-
+- 抽出 `withStoredCredentials(base, stored)` 到 `lib/config.js`，初始解析与回读**共用同一条规则**（config 优先，否则用磁盘凭据）——两个调用点各写一份迟早会不一致
+- `reconnect()` 在无可用凭据时**直接拒绝**并告警：一次设置编辑不该变成一次断线
 
 ### 修：读 `ctx.config` 需要 inject —— 它杀死了**每一条**消息
 
@@ -468,12 +400,6 @@ Cordis 里 `ctx.config` **需要插件在 `inject` 里声明**才能访问；我
 
 断言 174 → 176。
 
-
----
-
-## 未完成
-
-
 ### 修：回读配置把**凭据擦掉了**——第一条消息就断线
 
 上一轮修完 `ctx.config` 之后，启动日志里又出现 `reconnect → startChannel` 失败。根因比 inject 那个更深：
@@ -495,7 +421,6 @@ Cordis 里 `ctx.config` **需要插件在 `inject` 里声明**才能访问；我
 **教训**：`resolved` 这种"多层叠加后的结果"不能当基线去覆盖。**凡是重新计算，都要先问它是不是同一个东西**——这次不是，config 只是其中一层。
 
 断言 176 → 180。
-
 
 ---
 

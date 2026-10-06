@@ -35,7 +35,7 @@ import { REACTION, ReactionTracker } from '../lib/react.js'
 import { FeishuTransport } from '../lib/feishu.js'
 import { Notices, compactionFailedLine, jobLine, pressureLine, retryLine } from '../lib/notice.js'
 import { PROGRESS_ELEMENTS, ProgressCards, goalCard, todoCard } from '../lib/progress.js'
-import { Config, isVolatileRef, plainConfig, resolveConfig } from '../lib/config.js'
+import { Config, SETTINGS_NAMESPACE, isVolatileRef, plainConfig, resolveConfig } from '../lib/config.js'
 import { Fanout, agentEndLine, agentStartLine, runEndLine, runStartLine, subagentLine } from '../lib/fanout.js'
 import { DENIAL_REASON, denialReason, installToolGuard } from '../lib/guard.js'
 import { DROP, admit, isPolicyDrop } from '../lib/access.js'
@@ -1583,6 +1583,8 @@ async function main() {
     // then sits on its loading state forever with no error anywhere.
     const rowId = /-\s*id:\s*([A-Za-z0-9_-]+)/.exec(patchText)?.[1]
     assert.ok(rowId, 'the patch must declare a row id')
+    // Both halves carry the string, so both are pinned to the patch.
+    assert.equal(SETTINGS_NAMESPACE, rowId, 'the host half must use the bare patch id')
     assert.match(clientSource, new RegExp(`NAMESPACE = '${rowId}'`))
     assert.doesNotMatch(clientSource, new RegExp(`NAMESPACE = 'include:`))
   })
@@ -1641,13 +1643,19 @@ async function main() {
     const declared = inForm.filter((name) => schemaFields.includes(name))
     assert.deepEqual([...new Set(declared)].sort(), [...volatileFields].sort())
   })
-  await check('the plugin re-reads settings when the host applies them live', async () => {
-    // Volatile means the loader writes the value in place and announces it; a
-    // plugin that never listens keeps serving the old values while the UI shows
-    // the new ones.
+  await check('the plugin reads the LIVE config, not only an event', async () => {
+    // A Settings-page save does NOT emit `loader/volatile-update`: the config editor
+    // resolves the new values into the live references first, so the loader's own
+    // diff finds nothing to announce. A plugin that only listens keeps serving the
+    // old values while the page shows the new ones.
     const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
-    assert.match(indexSource, /ctx\.on\('loader\/volatile-update'/)
     assert.match(indexSource, /resolveConfig\(ctx\.config \?\? config\)/)
+    // ...so it reads the live config on every inbound message too, which makes no
+    // notification load-bearing.
+    assert.match(indexSource, /refreshSettings\('inbound message'\)/)
+    // The settings service reports the document change on its own context, which is
+    // a sibling of ours — only a root listener reaches it.
+    assert.match(indexSource, /ctx\.root\.on\('settings\/document-updated'/)
   })
 
   // A volatile field does not validate into a plain value: the loader hands out a

@@ -11,7 +11,7 @@
  * @module dsh-feishu-card
  */
 
-import { Config, hasCredentials, resolveConfig } from './lib/config.js'
+import { Config, SETTINGS_NAMESPACE, hasCredentials, resolveConfig } from './lib/config.js'
 import { FeishuTransport, readCardAction, readInboundMessage } from './lib/feishu.js'
 import { TurnRenderer } from './lib/turn.js'
 import { ConversationSessions, conversationKey, makeWorkspaceFiler } from './lib/session.js'
@@ -188,6 +188,8 @@ export async function apply(ctx, config = {}) {
   async function onMessage(data) {
     const inbound = readInboundMessage(data)
     if (!inbound) return
+    // Pick up any settings change before using the values it affects.
+    refreshSettings('inbound message')
 
     const text = stripMentionPlaceholders(inbound.text)
     const imageKeys = (inbound.imageKeys ?? []).slice(0, resolved.maxImagesPerMessage)
@@ -910,29 +912,49 @@ export async function apply(ctx, config = {}) {
   })
 
   /**
-   * Apply a live settings change.
+   * Re-read this plugin's settings from the live config.
    *
-   * The Settings page edits VOLATILE fields only, and the loader applies those by
-   * writing the new value into the live schema in place and announcing it here —
-   * the plugin is not restarted. Everything this plugin reads per message already
-   * sees the new value; only the two things captured at mount need re-applying.
+   * Reading back is the ONLY reliable way to see a Settings-page edit, and the
+   * reason is worth recording: the config editor resolves the new values straight
+   * into the live config references (`resolveConfig(fiber.runtime, resolved)`)
+   * BEFORE it reconciles the Loader, so by the time the Loader diffs the config
+   * nothing looks changed and `loader/volatile-update` never fires. A plugin that
+   * only listens for that event keeps serving the old values while the page shows
+   * the new ones — the settings look applied and are not.
+   *
+   * Called before each inbound message as well as on the events that do fire, so
+   * correctness does not depend on any notification arriving at all.
+   *
+   * @returns whether anything actually changed.
    */
-  ctx.on('loader/volatile-update', (paths) => {
-    const previous = resolved
+  const refreshSettings = (why) => {
     const next = resolveConfig(ctx.config ?? config)
-    // `next.cwd` is the CONFIGURED value; the resolved workspace is ours to keep.
-    resolved = { ...next, cwd: previous.cwd }
-    const changed = (paths ?? []).map((path) => (Array.isArray(path) ? path.join('.') : String(path)))
-    logger.info(`[feishu-card] settings changed live: ${changed.join(', ') || '(unspecified)'}`)
-
+    // `cwd` here is the CONFIGURED value; the resolved workspace is ours to keep.
+    const candidate = { ...next, cwd: resolved.cwd }
+    if (JSON.stringify(candidate) === JSON.stringify(resolved)) return false
+    const previous = resolved
+    resolved = candidate
+    const changed = Object.keys(candidate)
+      .filter((key) => JSON.stringify(candidate[key]) !== JSON.stringify(previous[key]))
+    logger.info(`[feishu-card] settings applied live (${why}): ${changed.join(', ')}`)
     if (next.appId !== previous.appId
       || next.appSecret !== previous.appSecret
       || next.domain !== previous.domain) {
       // The long connection was opened with the previous app, so it must be rebuilt.
       void reconnect()
-      return
+    } else if (next.cwd !== configuredCwd) {
+      void remountWorkspace(next.cwd)
     }
-    if (next.cwd !== configuredCwd) void remountWorkspace(next.cwd)
+    return true
+  }
+
+  // External edits (the patch file, HMR) do announce themselves.
+  ctx.on('loader/volatile-update', () => refreshSettings('volatile update'))
+  // A Settings-page save does not, but the settings service does report the
+  // document change; listening on the root is what reaches it, since the settings
+  // context is a sibling of ours rather than an ancestor.
+  ctx.root.on('settings/document-updated', (id) => {
+    if (id === SETTINGS_NAMESPACE) refreshSettings('settings page')
   })
 
   /** Re-point the workspace new conversations start in, after a live `cwd` change. */

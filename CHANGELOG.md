@@ -412,6 +412,38 @@ slot 注入的服务是作为 **props** 到达入口组件的，手挑子集转�
 
 ## 未完成
 
+
+### 修：设置页保存**不会**发 `loader/volatile-update`，所以"实时生效"没生效
+
+用户改了一个字号：写回**成功**（profile patch 里出现 `textSizes.reasoning: normal`），但插件日志里没有 `settings changed live`，插件也没重新挂载。也就是说值存下来了，**插件没看见**。
+
+查 `dsh-config-editor` 的 `edit()`：
+
+```js
+const resolved = fiber.ctx.waterfall(fiber, "internal/config", next, () => next);
+resolveConfig(fiber.runtime, resolved);      // ← 先把新值解析进活配置引用
+… await reconcileProfilePatches(root, patches, "dsh", [entry.options.id]);
+```
+
+它**先把新值直接写进运行时引用**，然后才去 reconcile。于是 loader 的 `_commitVolatile()` 再 diff 时发现"没有变化"，就**不发** `loader/volatile-update`。我监听的那个事件，从设置页保存时根本不会响。
+
+而我的 `resolved` 是挂载时**拷贝**出来的普通对象——引用被改了它不会变。**"实时生效"因此是假的**：页面显示新值，插件照旧用旧值。
+
+修法（不依赖任何通知）：
+
+- `refreshSettings()` 回读活配置（`resolveConfig(ctx.config ?? config)`），比较后只在**确实变化**时更新并记一行日志
+- 在**每条入站消息前**调用它——这样没有任何事件是承重的
+- 另外两个事件也接上：`loader/volatile-update`（外部改文件/HMR 会发）与 `settings/document-updated`（设置页会发；但它发在 settings 自己的 context 上，与我们是**兄弟**而非祖先，所以必须注册在 `ctx.root` 才听得到）
+
+顺带把命名空间抽成 `lib/config.js` 的 `SETTINGS_NAMESPACE`，与浏览器一半的常量一起被断言钉在 patch 行 id 上——两处各写一份字符串迟早会漂。
+
+**教训**：这次失败的形式是"保存成功了、值也存对了、日志里什么都没有"。**"看起来生效"和"真的生效"之间隔着一次回读**；凡是靠事件驱动的实时性，都要先确认那个事件真的会发。
+
+
+---
+
+## 未完成
+
 - `send_file` 拒绝路径的真实触发（实测时 agent 走了"复制进工作区再发"的路线）
 - `denyTools` 守卫与 `approvers` 的运行时实测（两处都需要一个能真实触发它们的场景）
 - `output: cot`（飞书原生思考消息）模式

@@ -7,11 +7,13 @@
   "main": "index.js",
   "exports": {
     ".": "./index.js",
+    "./client": "./client/client.js",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
     "lib",
+    "client",
     "cordis.patch.yml",
     "README.md"
   ],
@@ -23,6 +25,10 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
     }
   }
 }

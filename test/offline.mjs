@@ -1553,6 +1553,44 @@ async function main() {
   })
   await rm(sandbox, { recursive: true, force: true })
 
+  // The Plugins page shows a "configure" control only when a client half registers
+  // the row's EXACT key (`<package name>#<row id>`). Nothing validates that string,
+  // so a mismatch fails as "the control never appears" — silent, and invisible to
+  // every other check here.
+  console.log('settings page contract')
+  const repoRoot = new URL('../', import.meta.url)
+  const pkg = JSON.parse(await readFile(new URL('package.json', repoRoot), 'utf8'))
+  const patchText = await readFile(new URL('cordis.patch.yml', repoRoot), 'utf8')
+  const clientSource = await readFile(new URL(pkg.exports['./client'], repoRoot), 'utf8')
+
+  await check('the client half is declared for the web platform', () => {
+    assert.equal(typeof pkg.exports['./client'], 'string', 'exports["./client"] must point at the browser half')
+    assert.equal(pkg.dsh.client.platform, 'web')
+    assert.ok(pkg.files.includes('client'), 'the client directory must ship with the package')
+  })
+  await check('the client half registers the row key the patch declares', () => {
+    const rowId = /-\s*id:\s*([A-Za-z0-9_-]+)/.exec(patchText)?.[1]
+    assert.ok(rowId, 'the patch must declare a row id')
+    const expected = `${pkg.name}#${rowId}`
+    assert.match(clientSource, new RegExp(`ROW_KEY = '${expected.replace('#', '#')}'`), `ROW_KEY must be ${expected}`)
+  })
+  await check('the client half targets the keyed row-config slot', () => {
+    assert.match(clientSource, /slots\.inject\('plugins\.row\.config'/)
+    assert.match(clientSource, /name: 'plugins\.row\.config'/)
+  })
+  await check('the client half renders both views the owner asks for', () => {
+    // The owner renders the same entry twice: as the card's one-liner and as the
+    // page. A component that ignores `view` renders a form in a one-line slot.
+    assert.match(clientSource, /view === 'summary'/)
+    assert.match(clientSource, /props\.form/)
+  })
+  await check('the client half loads through the browser module loader', () => {
+    assert.match(clientSource, /window\.__ModuleLoader__\.load\(\{/)
+    assert.match(clientSource, /id: 'dsh-feishu-card'/)
+    // Build-free: React.createElement only, so there is no transform to forget.
+    assert.doesNotMatch(clientSource, /jsx>|React\.createElement\(\s*'<\//)
+  })
+
   console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)
   process.exit(failures === 0 ? 0 : 1)
 }

@@ -629,7 +629,11 @@ window.__ModuleLoader__.load({
       if (props.view === 'summary') {
         return h('span', null, '飞书连接、默认工作区与卡片外观')
       }
-      return h(ConfigPage, { form: props.form })
+      // The WHOLE props object is forwarded, not a hand-picked field: this entry
+      // point is where the slot's injected services arrive, and naming only some
+      // of them silently drops the rest. Naming `form` alone is exactly how the
+      // `configForms` service got lost and the page could never load.
+      return h(ConfigPage, props)
     }
 
     function apply(ctx) {

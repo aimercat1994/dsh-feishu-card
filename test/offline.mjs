@@ -1591,6 +1591,13 @@ async function main() {
     assert.match(clientSource, /configForms/)
     assert.match(clientSource, /exports\.inject = \['slots', 'configForms'\]/)
   })
+  await check('the entry point forwards the WHOLE props object, not picked fields', () => {
+    // The injected services arrive as props here. Forwarding a hand-picked subset
+    // silently drops the rest — naming only `form` is how `configForms` was lost,
+    // and the page then reported a missing namespace that was never missing.
+    assert.match(clientSource, /return h\(ConfigPage, props\)/)
+    assert.doesNotMatch(clientSource, /h\(ConfigPage, \{ form: props\.form \}\)/)
+  })
   await check('the client half renders both views the owner asks for', () => {
     // The owner renders the same entry twice: as the card's one-liner and as the
     // page. A component that ignores `view` renders a form in a one-line slot.

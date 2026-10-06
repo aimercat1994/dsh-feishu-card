@@ -374,6 +374,44 @@ function volatileForm(schema) {
 
 ## 未完成
 
+
+### 修：入口组件只转发了 `form`，把 `configForms` 服务丢了
+
+volatile 修好之后仍然报"命名空间未暴露"。这次读了 `configForms` 的实现：
+
+```js
+get(entryId) {
+  const existing = this.forms.get(entryId);
+  if (existing !== void 0) return existing;
+  const form = new ConfigFormController(this.owner, { namespace: entryId }, …);
+  this.forms.set(entryId, form);
+  this.mirror.ensure();
+  return form;          // ← 永远返回一个表单，从不返回 undefined
+}
+```
+
+**它从不返回 `undefined`**，所以"命名空间未暴露"这个诊断本身是错的——真相是 `props.configForms` 是 `undefined`，于是我的 `resolveForm` 退到 `props.form`（bundle 级页面没有），最终返回 `undefined`。
+
+根因是我的入口组件：
+
+```js
+function FeishuCardConfig(props) {
+  if (props.view === 'summary') return h('span', …)
+  return h(ConfigPage, { form: props.form })   // ← 只手挑了一个字段转发
+}
+```
+
+slot 注入的服务是作为 **props** 到达入口组件的，手挑子集转发就会**静默丢掉其余的**——丢掉 `configForms` 正是这一处。改成转发整个 props 对象。
+
+**我那条断言也太弱**：它只断言源码里出现过 `configForms`（而它出现在 `resolveForm` 里，所以通过），没有断言这个服务真的流到了页面。现在断言入口必须是 `h(ConfigPage, props)`，且禁止手挑字段的写法。
+
+**教训**：诊断文案是我自己写的，它把"服务没传进来"说成了"宿主没暴露命名空间"——**一个错误的诊断比没有诊断更贵**，它让我去查宿主，而问题在我这边。文案应当只陈述观察到的事实（"没拿到表单"），不要替我推断原因。
+
+
+---
+
+## 未完成
+
 - `send_file` 拒绝路径的真实触发（实测时 agent 走了"复制进工作区再发"的路线）
 - `denyTools` 守卫与 `approvers` 的运行时实测（两处都需要一个能真实触发它们的场景）
 - `output: cot`（飞书原生思考消息）模式

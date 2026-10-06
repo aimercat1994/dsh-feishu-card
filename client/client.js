@@ -6,11 +6,11 @@
  * `window.__ModuleLoader__`. `React.createElement` is used directly rather than
  * JSX so that no transform step exists to forget to run.
  *
- * It registers into the Plugins page's `plugins.row.config` keyed slot, which is
- * how a row of a bundle gets a "configure" control. The page OWNER supplies the
- * form: `form.state` carries the Host's accepted values and revision, and
- * `form.mutate` submits edits. This half never talks to the settings API itself —
- * it renders what it is handed and asks the owner to write.
+ * It registers into the Plugins page's `plugins.bundle.config` keyed slot, which is
+ * how a bundle gets a configuration section on its own page. That page is rendered
+ * with `view` alone — the owner passes no values — so this half reads its form from
+ * the `configForms` service by namespace, follows its snapshots, and submits edits
+ * through it.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-feishu-card',
@@ -20,8 +20,25 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
 
-    /** The row this page configures: `<package name>#<row id>`. */
-    const ROW_KEY = 'dsh-feishu-card#feishu-card'
+    /**
+     * The bundle this page configures: `plugins.bundle.config` is keyed by the
+     * PACKAGE name, and the page is the plugin's own — not a component row's.
+     *
+     * The row-level slot (`plugins.row.config`, keyed `<package>#<rowId>`) is for
+     * settings that belong to ONE component of a multi-row bundle. This plugin is
+     * a single row whose settings are the plugin's settings, so the bundle slot is
+     * the right home. The two also differ in what the owner passes: the row page
+     * receives `form`, the bundle page receives only `view` and must fetch its own.
+     */
+    const BUNDLE_KEY = 'dsh-feishu-card'
+
+    /**
+     * The settings namespace for this plugin: the BARE patch id, not the Loader
+     * entry id (`include:feishu-card`). The host keys `settings.describe()` by
+     * `entry.options.id`, and the shipped reference implementation uses its bare
+     * patch id the same way.
+     */
+    const NAMESPACE = 'feishu-card'
 
     const CARD_STROKE = 'var(--dsw-alias-settings-card-stroke)'
     const CARD_FILL = 'var(--dsw-alias-settings-card-fill)'
@@ -352,10 +369,58 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /**
+     * Resolve this page's form.
+     *
+     * Two sources, in order of preference:
+     *
+     *  1. the `configForms` service, looked up by namespace. Required here: the
+     *     bundle page is rendered with `view` alone, so nothing else would supply
+     *     the values.
+     *  2. the owner-supplied `form` prop, kept for the row-level slot's shape.
+     */
+    function resolveForm(props) {
+      const service = props.configForms
+      const owned = service && typeof service.get === 'function' ? service.get(NAMESPACE) : undefined
+      if (owned && typeof owned.getSnapshot === 'function') {
+        return {
+          source: 'service',
+          getSnapshot: () => owned.getSnapshot(),
+          subscribe: typeof owned.subscribe === 'function' ? (listener) => owned.subscribe(listener) : undefined,
+          mutate: (ops, revision) => owned.mutate(ops, revision),
+        }
+      }
+      const direct = props.form
+      if (direct && direct.state) {
+        return {
+          source: 'owner',
+          getSnapshot: () => direct.state,
+          subscribe: undefined,
+          mutate: (ops, revision) => direct.mutate(ops, revision),
+        }
+      }
+      return undefined
+    }
+
+    /** Follow a form's snapshots; the reference is stable until the form changes. */
+    function useFormSnapshot(form) {
+      const [snapshot, setSnapshot] = React.useState(() => (form ? form.getSnapshot() : undefined))
+      React.useEffect(() => {
+        if (!form) {
+          setSnapshot(undefined)
+          return undefined
+        }
+        setSnapshot(form.getSnapshot())
+        if (!form.subscribe) return undefined
+        return form.subscribe(() => setSnapshot(form.getSnapshot()))
+      }, [form])
+      return snapshot
+    }
+
     /** The page body: the groups, a dirty-aware save control, and the Host state. */
     function ConfigPage(props) {
-      const { form } = props
-      const state = form?.state
+      const form = React.useMemo(() => resolveForm(props), [props.configForms, props.form])
+      const state = useFormSnapshot(form)
       const revision = state?.revision
       // Edits live here until they are submitted; the owner's state is the
       // accepted truth, so a revision change discards a stale draft.
@@ -368,7 +433,17 @@ window.__ModuleLoader__.load({
         setMessage('')
       }, [revision])
 
-      if (!form || !state || state.status === 'loading') {
+      // These three states need different fixes, so they must not share one
+      // message: "no form at all" is a namespace-wiring problem, "unavailable" is
+      // the connection, and "loading" is just not-yet.
+      if (!form) {
+        return h(
+          'p',
+          { style: { margin: 0, fontSize: '13px', color: 'var(--dsw-alias-state-error-primary)' } },
+          `没有拿到配置表单：客户端未暴露命名空间 “${NAMESPACE}”。`,
+        )
+      }
+      if (!state || state.status === 'loading') {
         return h('p', { style: { margin: 0, fontSize: '13px', color: TERTIARY } }, '正在读取配置…')
       }
       if (state.status === 'unavailable') {
@@ -555,11 +630,15 @@ window.__ModuleLoader__.load({
     }
 
     function apply(ctx) {
-      ctx.slots.inject('plugins.row.config', () =>
+      ctx.slots.inject('plugins.bundle.config', () =>
         ctx.slots.register(
           {
-            name: 'plugins.row.config',
-            key: ROW_KEY,
+            name: 'plugins.bundle.config',
+            key: BUNDLE_KEY,
+            // Reaching the settings service directly is what makes this page work
+            // without the owner's help; `form` arrives only when the owner's own
+            // namespace lookup succeeded.
+            inject: () => ({ configForms: ctx.configForms }),
           },
           FeishuCardConfig,
         ),
@@ -567,7 +646,7 @@ window.__ModuleLoader__.load({
     }
 
     exports.apply = apply
-    exports.inject = ['slots']
+    exports.inject = ['slots', 'configForms']
     return module.exports
   },
 })

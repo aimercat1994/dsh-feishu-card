@@ -221,6 +221,16 @@ goal 卡片按钮 → `onCardAction` → `applyGoalOperation()` → **真正调�
 
 **改设置表单**：宿主侧只改 `lib/config.js`（`.description()` 就是表单里的说明）；表单本身在 `client/client.js` 的 `GROUPS` 里维护，**两处都要加**——schema 是校验契约，`GROUPS` 是给人看的。字段名两边必须一致。
 
+关于设置页挂在哪一级，三条约束都是从宿主源码读出来的，不是猜的：
+
+| | 值 | 依据 |
+| --- | --- | --- |
+| slot | `plugins.bundle.config` | 本插件是单行 bundle，配置属于插件本身；`plugins.row.config` 是给"多行 bundle 里某一个组件"用的 |
+| key | `dsh-feishu-card`（包名） | bundle 级 slot 按包名键控；行级才是 `<包名>#<rowId>` |
+| 命名空间 | `feishu-card`（**裸 patch id**） | `settings.describe()` 用 `entry.options.id`，而 Config inspect 里 `patchId = entry.options.id`、`id = entry.id`（后者是 `include:feishu-card` 这个 loader 目录键） |
+
+还有一个容易踩的差别：**bundle 级页面只收到 `view`，不收到 `form`**（行级才传 `form`）。所以 bundle 级必须自己从 `configForms` 服务按命名空间取表单并订阅它的快照。
+
 **加一个 agent 级工具**：在会话阶梯的 post-reach 钩子里用 `agent.ctx.effect(() => tools.register(...))` 注册，并**按 agent 实例**（WeakSet）去重——会话可能比 agent 活得久。`defineTool` 来自插件解析不到的包，所以直接传标准 JSON Schema；代价是参数校验得自己写。
 
 **加一个 `session/event` 处理**：在 `index.js` 的 switch 加 case。**先确认该事件真的存在**——见第 3 节的 module augmentation 陷阱。

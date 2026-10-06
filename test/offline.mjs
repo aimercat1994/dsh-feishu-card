@@ -1568,21 +1568,33 @@ async function main() {
     assert.equal(pkg.dsh.client.platform, 'web')
     assert.ok(pkg.files.includes('client'), 'the client directory must ship with the package')
   })
-  await check('the client half registers the row key the patch declares', () => {
+  await check('the client half registers at the BUNDLE level, keyed by package name', () => {
+    // plugins.bundle.config is keyed by the package name; the row-level slot is
+    // keyed `<package>#<rowId>` and is for one component of a multi-row bundle.
+    assert.match(clientSource, /slots\.inject\('plugins\.bundle\.config'/)
+    assert.match(clientSource, /name: 'plugins\.bundle\.config'/)
+    assert.match(clientSource, new RegExp(`BUNDLE_KEY = '${pkg.name}'`))
+  })
+  await check('the settings namespace is the BARE patch id, not the loader entry id', () => {
+    // `settings.describe()` keys namespaces by `entry.options.id`, which is the
+    // patch's own id (`feishu-card`) — the loader's directory shows the same row as
+    // `include:feishu-card`. Using the prefixed form finds nothing, and the page
+    // then sits on its loading state forever with no error anywhere.
     const rowId = /-\s*id:\s*([A-Za-z0-9_-]+)/.exec(patchText)?.[1]
     assert.ok(rowId, 'the patch must declare a row id')
-    const expected = `${pkg.name}#${rowId}`
-    assert.match(clientSource, new RegExp(`ROW_KEY = '${expected.replace('#', '#')}'`), `ROW_KEY must be ${expected}`)
+    assert.match(clientSource, new RegExp(`NAMESPACE = '${rowId}'`))
+    assert.doesNotMatch(clientSource, new RegExp(`NAMESPACE = 'include:`))
   })
-  await check('the client half targets the keyed row-config slot', () => {
-    assert.match(clientSource, /slots\.inject\('plugins\.row\.config'/)
-    assert.match(clientSource, /name: 'plugins\.row\.config'/)
+  await check('the client half fetches its own form, since the bundle page gets none', () => {
+    // renderSlot("plugins.bundle.config", { view: "page" }, …) passes no `form`.
+    assert.match(clientSource, /configForms/)
+    assert.match(clientSource, /exports\.inject = \['slots', 'configForms'\]/)
   })
   await check('the client half renders both views the owner asks for', () => {
     // The owner renders the same entry twice: as the card's one-liner and as the
     // page. A component that ignores `view` renders a form in a one-line slot.
     assert.match(clientSource, /view === 'summary'/)
-    assert.match(clientSource, /props\.form/)
+    assert.match(clientSource, /props\.configForms|props\.form/)
   })
   await check('the client half loads through the browser module loader', () => {
     assert.match(clientSource, /window\.__ModuleLoader__\.load\(\{/)

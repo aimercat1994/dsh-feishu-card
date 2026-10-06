@@ -22,6 +22,7 @@ import { ReactionTracker } from './lib/react.js'
 import { Notices } from './lib/notice.js'
 import { ProgressCards } from './lib/progress.js'
 import { Fanout } from './lib/fanout.js'
+import { installToolGuard } from './lib/guard.js'
 import { describeCall, describeDiff, formatTokens } from './lib/present.js'
 import { dirname, sep } from 'node:path'
 import {
@@ -107,12 +108,19 @@ export async function apply(ctx, config = {}) {
   // `signal.throwIfAborted()`, so `undefined` fails the entire call.
   const lifetime = new AbortController()
 
+  // Built once: the filer caches the workspace lookup and the sessions it has
+  // already attached, so a per-call instance would redo both every message.
+  const fileSession = makeWorkspaceFiler(ctx, resolved.cwd, logger)
   const sessions = new ConversationSessions({
     sessionController: ctx.sessionController,
     cwd: resolved.cwd,
     stateDir,
     logger,
-    onSession: makeWorkspaceFiler(ctx, resolved.cwd, logger),
+    onSession: async (sessionId, agent) => {
+      // Both ladder rungs land here, so this is where per-agent setup belongs.
+      ensureToolGuard(agent)
+      await fileSession(sessionId)
+    },
   })
   await sessions.load()
   // Group conversations that already exist, without waiting for their next message.
@@ -536,39 +544,29 @@ export async function apply(ctx, config = {}) {
     }
   })
 
+  /**
+   * Install this channel's tool guard on one agent.
+   *
+   * Registered on BOTH `agent/created` and the post-reach hook. The event alone is
+   * not sufficient: a session restored from disk rather than newly created may
+   * never announce itself that way, and a guard that silently does not apply is
+   * worse than none — the operator believes the tool is blocked.
+   *
+   * Idempotent per AGENT INSTANCE (a WeakSet, not the session id): a session can
+   * outlive one agent and be resumed by another, which must be guarded too.
+   */
+  const guarded = new WeakSet()
+  const ensureToolGuard = (agent) => {
+    if (!agent?.ctx || guarded.has(agent)) return
+    guarded.add(agent)
+    const dispose = installToolGuard(agent, resolved.denyTools, logger)
+    if (dispose) agentRegistrations.set(agent.id, dispose)
+  }
+
   ctx.on('agent/created', (payload) => {
     const agent = payload?.agent
-    if (!agent) return
-    const sessionId = agent.id
-    if (!sessions.serves(sessionId)) return
-    // Per-agent registrations belong on the agent's own context so they unwind
-    // with it; the disposer is kept here too, so unloading the plugin also
-    // removes them.
-    const dispose = agent.ctx.effect(() => {
-      const disposers = []
-      const tools = agent.ctx.get('tools')
-      if (tools && resolved.denyTools.length > 0) {
-        const denied = new Set(resolved.denyTools)
-        disposers.push(
-          tools.guard((execution) => {
-            const toolName = execution?.name
-            return toolName && denied.has(toolName)
-              ? '该工具在飞书渠道不可用，请直接在对话中用文字提问。'
-              : undefined
-          }),
-        )
-      }
-      return () => {
-        for (const disposer of disposers) {
-          try {
-            disposer()
-          } catch {
-            // A disposer that already ran is not an error.
-          }
-        }
-      }
-    })
-    agentRegistrations.set(sessionId, dispose)
+    if (!agent || !sessions.serves(agent.id)) return
+    ensureToolGuard(agent)
   })
 
   ctx.on('session/event', (session, event) => {

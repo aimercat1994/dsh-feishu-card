@@ -36,6 +36,7 @@ import { FeishuTransport } from '../lib/feishu.js'
 import { Notices, compactionFailedLine, jobLine, pressureLine, retryLine } from '../lib/notice.js'
 import { PROGRESS_ELEMENTS, ProgressCards, goalCard, todoCard } from '../lib/progress.js'
 import { Fanout, agentEndLine, agentStartLine, runEndLine, runStartLine, subagentLine } from '../lib/fanout.js'
+import { DENIAL_REASON, denialReason, installToolGuard } from '../lib/guard.js'
 
 let failures = 0
 async function check(name, fn) {
@@ -1112,6 +1113,72 @@ async function main() {
     assert.ok(!filed.includes('feishu-elsewhere'), 'another cwd is not claimed')
     assert.ok(!filed.includes('session-abc'), 'a non-Feishu session is not claimed')
     await rm(tmp2, { recursive: true, force: true })
+  })
+
+  console.log('tool guard')
+  await check('a denied tool gets a reason; everything else passes', () => {
+    const denied = new Set(['read', 'write'])
+    assert.equal(denialReason(denied, { name: 'read' }), DENIAL_REASON)
+    assert.equal(denialReason(denied, { name: 'write' }), DENIAL_REASON)
+    assert.equal(denialReason(denied, { name: 'bash' }), undefined)
+  })
+  await check('a malformed execution is allowed, not denied', () => {
+    // Denying on garbage would break every other tool in the process.
+    const denied = new Set(['read'])
+    for (const bad of [undefined, null, {}, { name: '' }, { name: 42 }, { name: null }]) {
+      assert.equal(denialReason(denied, bad), undefined, `must allow ${JSON.stringify(bad)}`)
+    }
+  })
+  await check('an empty deny list never denies', () => {
+    assert.equal(denialReason(new Set(), { name: 'read' }), undefined)
+  })
+
+  /** A minimal agent double exposing the scoped-registration surface. */
+  function agentDouble({ withTools = true, guardWorks = true } = {}) {
+    const installed = []
+    const disposed = []
+    const effects = []
+    const tools = withTools
+      ? { guard: (fn) => { if (!guardWorks) throw new Error('registry refused'); installed.push(fn); return () => disposed.push(fn) } }
+      : undefined
+    return {
+      agent: {
+        id: 'feishu-x',
+        ctx: {
+          get: (k) => (k === 'tools' ? tools : undefined),
+          effect: (fn) => { const d = fn(); effects.push(d); return d },
+        },
+      },
+      installed, disposed, effects,
+    }
+  }
+  await check('installing the guard registers it and logs the install', () => {
+    const logged = []
+    const h = agentDouble()
+    const dispose = installToolGuard(h.agent, ['read'], { info: (m) => logged.push(m), warn: () => {} })
+    assert.equal(h.installed.length, 1, 'exactly one guard registered')
+    assert.match(logged.join('\n'), /tool guard installed/)
+    assert.equal(h.installed[0]({ name: 'read' }), DENIAL_REASON)
+    assert.equal(h.installed[0]({ name: 'bash' }), undefined)
+    dispose()
+    assert.equal(h.disposed.length, 1, 'unwinding removes it')
+  })
+  await check('an empty deny list installs nothing at all', () => {
+    const h = agentDouble()
+    assert.equal(installToolGuard(h.agent, [], { info: () => {}, warn: () => {} }), undefined)
+    assert.equal(h.installed.length, 0)
+  })
+  await check('a registry that cannot accept a guard says so instead of failing silently', () => {
+    // The whole point of this module: never leave the operator believing a tool
+    // is blocked when it is not.
+    const warned = []
+    const h = agentDouble({ withTools: false })
+    assert.equal(installToolGuard(h.agent, ['read'], { info: () => {}, warn: (m) => warned.push(m) }), undefined)
+    assert.match(warned.join('\n'), /NOT in effect/)
+  })
+  await check('an agent with no scope is skipped, not crashed', () => {
+    assert.equal(installToolGuard(undefined, ['read'], { info: () => {}, warn: () => {} }), undefined)
+    assert.equal(installToolGuard({ id: 'x' }, ['read'], { info: () => {}, warn: () => {} }), undefined)
   })
 
   console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)

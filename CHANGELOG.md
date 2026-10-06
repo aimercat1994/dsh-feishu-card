@@ -190,7 +190,23 @@ README 重写为完整交付文档；新增 `docs/ARCHITECTURE.md`（模块地�
 
 **过程中自己引入又修掉的一个真 bug**：把"不支持的类型"回执放在了发送者过滤**之前**——另一个机器人发的文件会让我的机器人回它一句，两个机器人可以这样永远对答下去；而且那时 `readInboundMessage` 对不支持类型只返回 `{chatId, unsupported}`，连 `messageId` 都没有，回执根本不会串到原消息上。现在策略门（发送者/白名单）先过，回执才有资格发出，并补了一条断言把顺序固定下来。
 
-**仍未验证**：真实飞书里的图片链路。三段（嗅探/下载/入 prompt）都只跑了假 transport——和当初反应反馈栽的是同一个坑，所以这里明确标注，不写成"已完成"。
+### 图片链路的真实首测：两个 bug
+
+第一次在飞书里发真图就翻车了，两个都是真 bug：
+
+**① `collectStream is not defined`。** 给 `lib/feishu.js` 加 media 导入的那段补丁，锚点写的是 `import { createLogger } from './log.js'`——**这个文件根本没有这行**（它的 logger 是构造参数，不 import）。`str.replace` 没匹配就原样返回，而脚本**没有 assert 就打印了"已修补"**。于是 `feishu.js` 引用了 `collectStream` / `parsePostContent` / `sniffImageMediaType` 三个符号却一个都没导入。
+
+**这和当初反应反馈那个 bug 是同一个失败模式，连原因都一样**：编辑脚本静默匹配失败 + 没断言。我甚至刚写完"假 transport 掩盖问题"的反思就又犯了一次——因为这次掩盖它的是**另一个盲区**：我验证了 `typeof c.im.v1.messageResource.get === 'function'`（SDK 表面），却没验证**自己模块里的符号是否解析得到**。`node --check` 只做语法解析，看不见未导入的标识符。
+
+**② `prompt content must include non-whitespace text or an attachment`。** 图片下载失败后，纯图片消息组装出的 `content` 是空数组，宿主直接拒绝。用户看到的是平台内部错误文案。修复：内容为空时不再发起 prompt，改用渠道自己的话说明。
+
+**防复发**：新增静态交叉检查——扫描 `index.js` + `lib/*.js` 里对**其他模块导出符号**的裸引用，断言每处都有对应导入。它同时覆盖静态 `import {} from` 与动态 `const {} = await import()`，并排除注释、属性访问（`obj.x`）与对象键（`x:`）。
+
+我验证过它**不是空转**：把 `feishu.js` 的 media 导入删掉 → 报出三个符号；把 `notice.js` 的动态导入注释掉 → 报出 `buildNoticeCard`。这条断言如果早存在，两个 bug 都进不了运行时。
+
+断言 146 → 147（新增一条覆盖面很宽的检查）。
+
+**仍未验证**：修好后的图片链路。等下一次真实发图确认。
 
 断言 129 → 146。
 

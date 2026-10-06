@@ -321,6 +321,17 @@ export async function apply(ctx, config = {}) {
       const content = promptContent(text, images.parts)
       const imageNote = failureNote(images.failures)
       if (imageNote) void transport.sendText(imageNote, { chatId: inbound.chatId, replyToMessageId: inbound.messageId })
+      if (content.length === 0) {
+        // An image-only message whose images all failed would otherwise prompt
+        // with nothing, and the controller refuses that with a raw internal
+        // message ("must include non-whitespace text or an attachment"). Say it
+        // in the chat's own terms instead.
+        await transport.sendText(t.nothingToSend, {
+          chatId: inbound.chatId,
+          replyToMessageId: inbound.messageId,
+        })
+        return
+      }
       await ctx.sessionController.prompt(
         {
           requestId: nextId(),

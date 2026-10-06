@@ -1381,6 +1381,76 @@ async function main() {
     )
   })
 
+  // `node --check` only parses a file; it cannot see that a body references a
+  // symbol no one imported. That gap shipped a live failure twice — the reaction
+  // tracker calling transport methods that did not exist, and feishu.js calling
+  // `collectStream` with no import — each time because an edit script silently
+  // matched nothing. This check compares real cross-module references against the
+  // real import statements.
+  console.log('cross-module references')
+  await check("no module uses another module's export without importing it", async () => {
+    const root = new URL('../', import.meta.url)
+    const libDir = new URL('lib/', root)
+    const files = [
+      'index.js',
+      ...(await readdir(libDir)).filter((f) => f.endsWith('.js')).map((f) => `lib/${f}`),
+    ]
+    const sources = new Map()
+    for (const file of files) sources.set(file, await readFile(new URL(file, root), 'utf8'))
+
+    // Prose mentions must not count as references.
+    const strip = (src) =>
+      src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+
+    const exportedBy = new Map()
+    for (const [file, raw] of sources) {
+      for (const m of strip(raw).matchAll(/export\s+(?:async\s+)?(?:function|const|let|class)\s+([A-Za-z_$][\w$]*)/g)) {
+        if (!exportedBy.has(m[1])) exportedBy.set(m[1], new Set())
+        exportedBy.get(m[1]).add(file)
+      }
+    }
+    assert.ok(exportedBy.size >= 20, `expected many exports, saw ${exportedBy.size}`)
+
+    const problems = []
+    for (const [file, raw] of sources) {
+      const src = strip(raw)
+      const imported = new Set()
+      const addNames = (list) => {
+        for (const part of list.split(',')) {
+          const name = part.trim().split(/\s+as\s+/).pop().trim()
+          if (name) imported.add(name)
+        }
+      }
+      // The list may span lines...
+      for (const m of src.matchAll(/import\s*\{([\s\S]*?)\}\s*from/g)) addNames(m[1])
+      // ...and a module may be pulled in dynamically instead.
+      for (const m of src.matchAll(/(?:const|let|var)\s*\{([\s\S]*?)\}\s*=\s*await\s+import\s*\(/g)) addNames(m[1])
+      // A name can also be local here: a parameter or declaration of the same
+      // spelling is not a reference to the other module's export.
+      const local = new Set()
+      for (const m of src.matchAll(/(?:const|let|var|function|class)\s+([A-Za-z_$][\w$]*)/g)) local.add(m[1])
+      for (const m of src.matchAll(/\(([^()]*)\)\s*(?:=>|\{)/g)) {
+        for (const part of m[1].split(',')) {
+          const ids = part.trim().replace(/=.*$/, '').match(/[A-Za-z_$][\w$]*/g)
+          if (ids?.length) local.add(ids[ids.length - 1])
+        }
+      }
+      for (const m of src.matchAll(/\b([A-Za-z_$][\w$]*)\s*=>/g)) local.add(m[1])
+
+      for (const [name, owners] of exportedBy) {
+        if (owners.has(file) || imported.has(name) || local.has(name)) continue
+        // Excluded: `obj.name` (property access) and `name:` (object key or label).
+        // A ternary's `name` is missed as a result, which is the safe direction —
+        // a missed reference cannot fail a correct build.
+        const pattern = new RegExp(`(?<![.\\w$])${name.replace(/\$/g, '\\$')}(?![\\w$])(?![\\w$]*\\s*:)`)
+        if (pattern.test(src)) {
+          problems.push(`${file} uses ${name} (from ${[...owners].join(', ')}) without importing it`)
+        }
+      }
+    }
+    assert.deepEqual(problems, [], problems.join('; '))
+  })
+
   console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)
   process.exit(failures === 0 ? 0 : 1)
 }

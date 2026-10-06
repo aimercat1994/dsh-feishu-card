@@ -39,6 +39,11 @@ lib/
   media.js            入站媒体：类型嗅探、富文本解析、有界流收集
   images.js           图片流水线：逐张下载/校验/组装 prompt，失败只损失该张
   outbound.js         出站文件：realpath 路径安全 + send_file 工具定义
+
+> **关于 `outbound.js` 的路径检查**：它做得对（先 realpath 再比较，符号链接逃逸被拦），但
+> **它不构成安全边界**。实测：让 agent 发 `/etc/hostname`，它把文件复制进工作区再发副本，
+> 完全绕过。原因是 agent 本身就有文件工具，"能读什么"决定"能发什么"。这条检查的价值是
+> 约束工具自身参数、避免误发；真正的边界是部署文件策略与审批。详见 README 的说明。
   access.js           入站准入：谁可以开对话、为什么被丢弃（纯函数）
   log.js              控制台 + 落盘双写日志
 test/offline.mjs      102 项离线断言

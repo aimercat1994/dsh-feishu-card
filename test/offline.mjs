@@ -38,6 +38,8 @@ import { PROGRESS_ELEMENTS, ProgressCards, goalCard, todoCard } from '../lib/pro
 import { Fanout, agentEndLine, agentStartLine, runEndLine, runStartLine, subagentLine } from '../lib/fanout.js'
 import { DENIAL_REASON, denialReason, installToolGuard } from '../lib/guard.js'
 import { DROP, admit, isPolicyDrop } from '../lib/access.js'
+import { collectStream, parsePostContent, sniffImageMediaType } from '../lib/media.js'
+import { failureNote, promptContent, resolveImages } from '../lib/images.js'
 
 let failures = 0
 async function check(name, fn) {
@@ -1237,6 +1239,146 @@ async function main() {
     assert.equal(isPolicyDrop(DROP.needsMention), false)
     assert.equal(isPolicyDrop(DROP.empty), false)
     assert.equal(isPolicyDrop(DROP.notAUser), false)
+  })
+
+  console.log('inbound media')
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0])
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0])
+  const gif = Buffer.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0, 0, 0, 0, 0, 0])
+  const webp = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBP'), Buffer.alloc(4)])
+
+  await check('image types are sniffed from the bytes, not guessed', () => {
+    // Feishu sends no content type; a wrong guess is refused by the attachment
+    // service, which would turn every image into a failed prompt.
+    assert.equal(sniffImageMediaType(png), 'image/png')
+    assert.equal(sniffImageMediaType(jpeg), 'image/jpeg')
+    assert.equal(sniffImageMediaType(gif), 'image/gif')
+    assert.equal(sniffImageMediaType(webp), 'image/webp')
+  })
+  await check('an unrecognised or truncated payload is refused, never assumed', () => {
+    assert.equal(sniffImageMediaType(Buffer.from('not an image at all')), undefined)
+    assert.equal(sniffImageMediaType(Buffer.from([0x89, 0x50])), undefined)
+    assert.equal(sniffImageMediaType(undefined), undefined)
+    assert.equal(sniffImageMediaType(Buffer.alloc(0)), undefined)
+  })
+  await check('a rich-text post yields its text and every nested image', () => {
+    const parsed = parsePostContent(JSON.stringify({
+      title: '看这个',
+      content: [[{ tag: 'text', text: 'hello ' }, { tag: 'img', image_key: 'img_1' }],
+                [{ tag: 'a', text: 'link' }, { tag: 'img', image_key: 'img_2' }]],
+    }))
+    assert.equal(parsed.text, '看这个\nhello link')
+    assert.deepEqual(parsed.imageKeys, ['img_1', 'img_2'])
+  })
+  await check('a malformed post yields what it can instead of throwing', () => {
+    assert.deepEqual(parsePostContent('{not json'), { text: '', imageKeys: [] })
+    assert.deepEqual(parsePostContent(undefined), { text: '', imageKeys: [] })
+    assert.deepEqual(parsePostContent('null'), { text: '', imageKeys: [] })
+  })
+  await check('stream collection is bounded', async () => {
+    async function* chunks(...list) { for (const c of list) yield c }
+    const got = await collectStream(chunks(Buffer.from('ab'), Buffer.from('cd')), 100)
+    assert.equal(got.toString(), 'abcd')
+    await assert.rejects(
+      () => collectStream(chunks(Buffer.alloc(10), Buffer.alloc(10)), 15),
+      /exceeds/,
+    )
+  })
+
+  console.log('image pipeline')
+  /** A transport whose download behaviour the test controls. */
+  function imageHarness({ download, perMessage = 2 }) {
+    return {
+      transport: { downloadImage: download ?? (async () => ({ bytes: png, mediaType: 'image/png' })) },
+      attachments: {
+        imageLimits: { maxImageBytes: 1000, maxImagesPerMessage: perMessage, mediaTypes: ['image/png', 'image/jpeg'] },
+        validateImage: async () => {},
+      },
+    }
+  }
+  await check('images become prompt parts in order', async () => {
+    const h = imageHarness({})
+    const out = await resolveImages({ imageKeys: ['a', 'b'], messageId: 'm', transport: h.transport, attachments: h.attachments })
+    assert.equal(out.parts.length, 2)
+    assert.equal(out.parts[0].type, 'image')
+    assert.equal(out.parts[0].mediaType, 'image/png')
+    assert.equal(out.parts[0].data, png.toString('base64'))
+    assert.deepEqual(out.failures, [])
+  })
+  await check('the deployment cap wins over the configured limit', async () => {
+    const h = imageHarness({})
+    // limit 10 but the deployment allows 2 per message.
+    const out = await resolveImages({ imageKeys: ['a', 'b', 'c'], messageId: 'm', transport: h.transport, attachments: h.attachments, limit: 10 })
+    assert.equal(out.parts.length, 2)
+    assert.match(out.failures.join(' '), /最多附带 2 张/)
+  })
+  await check('one bad image never costs the others', async () => {
+    const h = imageHarness({
+      // Room for three so the middle failure is actually reached.
+      perMessage: 5,
+      download: async (mid, key) => (key === 'bad' ? undefined : { bytes: jpeg, mediaType: 'image/jpeg' }),
+    })
+    const out = await resolveImages({ imageKeys: ['ok1', 'bad', 'ok2'], messageId: 'm', transport: h.transport, attachments: h.attachments })
+    assert.equal(out.parts.length, 2)
+    assert.equal(out.failures.length, 1)
+    assert.match(out.failures[0], /格式无法识别/)
+  })
+  await check('an unsupported media type is refused with a reason', async () => {
+    const h = imageHarness({ download: async () => ({ bytes: gif, mediaType: 'image/gif' }) })
+    const out = await resolveImages({ imageKeys: ['a'], messageId: 'm', transport: h.transport, attachments: h.attachments })
+    assert.equal(out.parts.length, 0)
+    assert.match(out.failures[0], /不支持 image\/gif/)
+  })
+  await check('a download failure is reported, not thrown', async () => {
+    const h = imageHarness({ download: async () => { throw new Error('network down') } })
+    const out = await resolveImages({ imageKeys: ['a'], messageId: 'm', transport: h.transport, attachments: h.attachments, logger: { warn: () => {} } })
+    assert.equal(out.parts.length, 0)
+    assert.match(out.failures[0], /network down/)
+  })
+  await check('a policy refusal is reported per image, before the prompt', async () => {
+    // Pre-validation keeps a policy refusal from rejecting the whole prompt.
+    const h = imageHarness({})
+    h.attachments.validateImage = async () => { throw new Error('too many pixels') }
+    const out = await resolveImages({ imageKeys: ['a'], messageId: 'm', transport: h.transport, attachments: h.attachments, logger: { warn: () => {} } })
+    assert.equal(out.parts.length, 0)
+    assert.match(out.failures[0], /too many pixels/)
+  })
+  await check('no images means no work at all', async () => {
+    const out = await resolveImages({ imageKeys: [], messageId: 'm', transport: {} })
+    assert.deepEqual(out, { parts: [], failures: [] })
+  })
+  await check('the prompt puts text first and omits an empty text part', () => {
+    assert.deepEqual(promptContent('hi', [{ type: 'image' }]), [{ type: 'text', text: 'hi' }, { type: 'image' }])
+    // An image with no caption is still a message.
+    assert.deepEqual(promptContent('', [{ type: 'image' }]), [{ type: 'image' }])
+  })
+  await check('the failure note is one line, or nothing', () => {
+    assert.equal(failureNote([]), '')
+    assert.equal(failureNote(undefined), '')
+    assert.match(failureNote(['a', 'b']), /⚠️ a；b/)
+  })
+
+  console.log('media-aware admission')
+  await check('an image with no caption is admitted', () => {
+    // The empty-body rule must not swallow a picture.
+    assert.deepEqual(admit(msg(), open, '', 1), { allow: true })
+    assert.equal(admit(msg(), open, '', 0).reason, DROP.empty)
+  })
+  await check('an unsupported message type is dropped as unsupported', () => {
+    assert.equal(admit({ ...msg(), unsupported: 'file' }, open, 'hi', 0).reason, DROP.unsupported)
+    assert.equal(isPolicyDrop(DROP.unsupported), false, 'not a policy rejection')
+  })
+  await check('another bot gets NO reply about an unsupported type', () => {
+    // The caller answers `unsupported`. If that were decided before the sender
+    // gate, two bots would answer each other's attachments forever.
+    const fromBot = { ...msg({ senderType: 'app' }), unsupported: 'file' }
+    assert.equal(admit(fromBot, open, '', 0).reason, DROP.notAUser)
+    // ...and the same for a sender the allowlist excludes.
+    const excluded = { ...msg({ senderId: 'ou_no' }), unsupported: 'file' }
+    assert.equal(
+      admit(excluded, { ...open, senderAllowlist: ['ou_yes'] }, '', 0).reason,
+      DROP.senderNotAllowed,
+    )
   })
 
   console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)

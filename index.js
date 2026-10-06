@@ -23,7 +23,8 @@ import { Notices } from './lib/notice.js'
 import { ProgressCards } from './lib/progress.js'
 import { Fanout } from './lib/fanout.js'
 import { installToolGuard } from './lib/guard.js'
-import { admit, isPolicyDrop } from './lib/access.js'
+import { DROP, admit, isPolicyDrop } from './lib/access.js'
+import { failureNote, promptContent, resolveImages } from './lib/images.js'
 import { describeCall, describeDiff, formatTokens } from './lib/present.js'
 import { dirname, sep } from 'node:path'
 import {
@@ -184,8 +185,18 @@ export async function apply(ctx, config = {}) {
     if (!inbound) return
 
     const text = stripMentionPlaceholders(inbound.text)
-    const decision = admit(inbound, resolved, text)
+    const imageKeys = (inbound.imageKeys ?? []).slice(0, resolved.maxImagesPerMessage)
+    const decision = admit(inbound, resolved, text, imageKeys.length)
     if (!decision.allow) {
+      // An unsupported type is the sender's problem to fix, so say so — but only
+      // after the policy gates admitted them, so another bot gets no reply.
+      if (decision.reason === DROP.unsupported) {
+        await transport.sendText(t.unsupportedMessageType(inbound.unsupported), {
+          chatId: inbound.chatId,
+          replyToMessageId: inbound.messageId,
+        })
+        return
+      }
       // A policy rejection is worth a log line: without it, an operator whose
       // messages are being dropped has nothing to look at. Ordinary traffic
       // (an unmentioned group message, an empty body) is not logged.
@@ -295,12 +306,27 @@ export async function apply(ctx, config = {}) {
       // chat that goes silent for a minute looks broken.
       await reactions.show(inbound.messageId, 'ack')
 
+      // Images are resolved just before prompting: a failure here costs only the
+      // image, never the user's text.
+      const images = resolved.images
+        ? await resolveImages({
+            imageKeys,
+            messageId: inbound.messageId,
+            transport,
+            attachments: ctx.get('attachments'),
+            limit: resolved.maxImagesPerMessage,
+            logger,
+          })
+        : { parts: [], failures: [] }
+      const content = promptContent(text, images.parts)
+      const imageNote = failureNote(images.failures)
+      if (imageNote) void transport.sendText(imageNote, { chatId: inbound.chatId, replyToMessageId: inbound.messageId })
       await ctx.sessionController.prompt(
         {
           requestId: nextId(),
           sessionId,
           mode: 'queue',
-          content: [{ type: 'text', text }],
+          content,
         },
         lifetime.signal,
       )

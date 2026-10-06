@@ -44,6 +44,14 @@
 - todo 与 goal **各占一张独立卡片、跨回合存活**；goal 按钮真正调用 `ctx.goals`
 - 工作流 / 子代理扇出叙述
 
+**图片输入**（`images`，默认开启）
+
+- 直接发图片、或带图的多图文（`post`）都会被读取，最多 `maxImagesPerMessage` 张（默认 4，部署策略更小则以部署为准）
+- 飞书返回的图片资源**不带 content type**，所以类型由字节头嗅探得出；猜错会被附件服务按"声明的类型不符"拒掉，等于每张图都失败
+- 单张失败只损失那张图：下载失败、格式不支持、超出部署策略都会**单独说明**，用户输入的文字照常送达
+- 发送前用 `attachments.validateImage` 预校验，避免策略拒绝把整条 prompt（含文字）一起打回
+- 暂不支持的入站类型（文件/音频/表情包）会**回一句话**，而不是让消息无声消失
+
 **运维**
 
 - 拒绝入站消息时写日志（`senderAllowlist` / `groupAllowlist` 命中会记录 chat 与 sender），
@@ -153,6 +161,7 @@ FEISHU_DOMAIN=              # 国际版 Lark 填 https://open.larksuite.com
     notices: true
     pressureWarnTokens: 120000           # 上下文用量告警阈值
     reactionFeedback: true               # 在用户消息上打状态表情
+    images: true                         # 图片随 prompt 送入（见下）
 
     # 生命周期
     autoResumeGoals: false               # 每条消息前尝试重新武装被 disarm 的 goal
@@ -196,7 +205,8 @@ node test/offline.mjs
 
 | 限制 | 说明 |
 | --- | --- |
-| 只处理文本消息 | 图片/文件消息被忽略；图片输入与 `send_file` 尚未实现 |
+| 入站只支持文字与图片 | 文件/音频/表情包会回一句"暂不支持"，不会处理 |
+| 出站文件（`send_file`）未实现 | agent 还不能把产物发到聊天里 |
 | 无 CoT 输出模式 | HFC 的 `output: cot`（飞书原生思考消息）是另一条渲染路径，未实现 |
 | `denyTools` 的运行时效果未验证 | 逻辑已抽出并离线覆盖，注册点覆盖两条会话路径，但默认名单为空（与 GUI 同权限），因此**该路径从未被真实触发过**。要依赖它之前请先按 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) 的验证清单实测一次 |
 | 多问题逐张追问 | 一次多问按顺序发多张卡片，未合并为一张表单 |

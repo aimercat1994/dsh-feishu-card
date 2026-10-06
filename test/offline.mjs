@@ -35,7 +35,7 @@ import { REACTION, ReactionTracker } from '../lib/react.js'
 import { FeishuTransport } from '../lib/feishu.js'
 import { Notices, compactionFailedLine, jobLine, pressureLine, retryLine } from '../lib/notice.js'
 import { PROGRESS_ELEMENTS, ProgressCards, goalCard, todoCard } from '../lib/progress.js'
-import { Config } from '../lib/config.js'
+import { Config, isVolatileRef, plainConfig, resolveConfig } from '../lib/config.js'
 import { Fanout, agentEndLine, agentStartLine, runEndLine, runStartLine, subagentLine } from '../lib/fanout.js'
 import { DENIAL_REASON, denialReason, installToolGuard } from '../lib/guard.js'
 import { DROP, admit, isPolicyDrop } from '../lib/access.js'
@@ -1641,6 +1641,51 @@ async function main() {
     const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
     assert.match(indexSource, /ctx\.on\('loader\/volatile-update'/)
     assert.match(indexSource, /resolveConfig\(ctx\.config \?\? config\)/)
+  })
+
+  // A volatile field does not validate into a plain value: the loader hands out a
+  // REFERENCE (`{get, set}`) so it can rewrite the live schema in place. Reading
+  // `config.cwd` without unwrapping therefore yields an object, and the plugin
+  // passes `[object Object]` where a path belongs — which is exactly what happened
+  // when these fields were first marked volatile.
+  console.log('volatile config references')
+  const validated = Config({})
+
+  await check('a volatile field validates into a reference, not a value', () => {
+    assert.equal(typeof validated.cwd, 'object')
+    assert.equal(isVolatileRef(validated.cwd), true)
+  })
+  await check('the reference protocol is the GLOBAL symbol, so it survives copies', () => {
+    // Symbol.for is what makes this recognisable without importing cosmokit, which
+    // this plugin cannot resolve.
+    assert.equal(Symbol.for('cosmokit.volatile.write') in validated.cwd, true)
+  })
+  await check('plainConfig unwraps references, including nested ones', () => {
+    const plain = plainConfig(validated)
+    assert.equal(typeof plain.cwd, 'string')
+    assert.equal(typeof plain.images, 'boolean')
+    assert.equal(typeof plain.textSizes, 'object')
+    assert.equal(typeof plain.textSizes.answer, 'string')
+    assert.equal(isVolatileRef(plain.textSizes), false)
+    assert.equal(isVolatileRef(plain.textSizes.answer), false)
+  })
+  await check('resolveConfig returns plain values from a validated config', () => {
+    // The end-to-end invariant: this is the regression that shipped [object Object].
+    const resolved = resolveConfig(validated)
+    assert.equal(typeof resolved.cwd, 'string')
+    assert.equal(typeof resolved.sessionScope, 'string')
+    assert.equal(typeof resolved.images, 'boolean')
+    assert.equal(typeof resolved.maxImagesPerMessage, 'number')
+    assert.deepEqual(resolved.textSizes, {
+      reasoning: 'notation', activity: 'notation', answer: 'normal', footer: 'notation',
+    })
+    assert.ok(!JSON.stringify(resolved).includes('[object Object]'))
+  })
+  await check('a plain config object still resolves normally', () => {
+    const resolved = resolveConfig({ cwd: '/tmp/x', images: false })
+    assert.equal(resolved.cwd, '/tmp/x')
+    assert.equal(resolved.images, false)
+    assert.equal(resolved.sessionScope, 'chat')
   })
 
   console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)

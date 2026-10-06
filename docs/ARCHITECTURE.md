@@ -35,6 +35,8 @@ lib/
   react.js            反应反馈：换挡与终态一次性
   progress.js         todo / goal 卡片：独立实体、原位更新
   fanout.js           工作流 / 子代理叙述
+  guard.js            工具守卫：按名称拒绝工具，纯判定 + 默认放行的容错
+  access.js           入站准入：谁可以开对话、为什么被丢弃（纯函数）
   log.js              控制台 + 落盘双写日志
 test/offline.mjs      102 项离线断言
 ```

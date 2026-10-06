@@ -37,6 +37,7 @@ import { Notices, compactionFailedLine, jobLine, pressureLine, retryLine } from 
 import { PROGRESS_ELEMENTS, ProgressCards, goalCard, todoCard } from '../lib/progress.js'
 import { Fanout, agentEndLine, agentStartLine, runEndLine, runStartLine, subagentLine } from '../lib/fanout.js'
 import { DENIAL_REASON, denialReason, installToolGuard } from '../lib/guard.js'
+import { DROP, admit, isPolicyDrop } from '../lib/access.js'
 
 let failures = 0
 async function check(name, fn) {
@@ -1179,6 +1180,63 @@ async function main() {
   await check('an agent with no scope is skipped, not crashed', () => {
     assert.equal(installToolGuard(undefined, ['read'], { info: () => {}, warn: () => {} }), undefined)
     assert.equal(installToolGuard({ id: 'x' }, ['read'], { info: () => {}, warn: () => {} }), undefined)
+  })
+
+  console.log('admission control')
+  const msg = (over = {}) => ({
+    senderType: 'user', chatType: 'p2p', chatId: 'oc_1', senderId: 'ou_1', mentions: [], text: 'hi', ...over,
+  })
+  const open = { requireMention: false, groupAllowlist: [], senderAllowlist: [] }
+
+  await check('an unrestricted policy admits a direct message', () => {
+    assert.deepEqual(admit(msg(), open, 'hi'), { allow: true })
+  })
+  await check("this app's own echo and other bots never open a turn", () => {
+    assert.equal(admit(msg({ senderType: 'app' }), open, 'hi').reason, DROP.notAUser)
+  })
+  await check('an EMPTY allowlist means no restriction, a non-empty one must match', () => {
+    // The easy bug here is treating "empty list" as "deny everything".
+    assert.equal(admit(msg(), open, 'hi').allow, true)
+    // The listed sender passes...
+    assert.equal(admit(msg({ senderId: 'ou_1' }), { ...open, senderAllowlist: ['ou_1'] }, 'hi').allow, true)
+    // ...and an unlisted one does not.
+    const denied = admit(msg({ senderId: 'ou_nope' }), { ...open, senderAllowlist: ['ou_1'] }, 'hi')
+    assert.equal(denied.reason, DROP.senderNotAllowed)
+  })
+  await check('the group allowlist only constrains GROUPS', () => {
+    const policy = { ...open, groupAllowlist: ['oc_allowed'] }
+    // A direct message has no chat allowlist semantics; it must still pass.
+    assert.equal(admit(msg(), policy, 'hi').allow, true)
+    assert.equal(admit(msg({ chatType: 'group', chatId: 'oc_allowed', mentions: [{}] }), policy, 'hi').allow, true)
+    assert.equal(
+      admit(msg({ chatType: 'group', chatId: 'oc_other', mentions: [{}] }), policy, 'hi').reason,
+      DROP.groupNotAllowed,
+    )
+  })
+  await check('the sender allowlist also applies inside groups', () => {
+    const policy = { ...open, senderAllowlist: ['ou_1'] }
+    assert.equal(
+      admit(msg({ chatType: 'group', senderId: 'ou_2', mentions: [{}] }), policy, 'hi').reason,
+      DROP.senderNotAllowed,
+    )
+  })
+  await check('requireMention gates groups only', () => {
+    const policy = { ...open, requireMention: true }
+    assert.equal(admit(msg(), policy, 'hi').allow, true, 'a DM needs no mention')
+    assert.equal(admit(msg({ chatType: 'group' }), policy, 'hi').reason, DROP.needsMention)
+    assert.equal(admit(msg({ chatType: 'group', mentions: [{ key: '@_user_1' }] }), policy, 'hi').allow, true)
+  })
+  await check('an empty body is dropped after mention stripping', () => {
+    assert.equal(admit(msg(), open, '').reason, DROP.empty)
+    assert.equal(admit(undefined, open, 'hi').reason, DROP.empty)
+  })
+  await check('only policy rejections are worth logging', () => {
+    // Logging every unmentioned group message would drown the log in a busy group.
+    assert.equal(isPolicyDrop(DROP.senderNotAllowed), true)
+    assert.equal(isPolicyDrop(DROP.groupNotAllowed), true)
+    assert.equal(isPolicyDrop(DROP.needsMention), false)
+    assert.equal(isPolicyDrop(DROP.empty), false)
+    assert.equal(isPolicyDrop(DROP.notAUser), false)
   })
 
   console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)

@@ -23,6 +23,7 @@ import { Notices } from './lib/notice.js'
 import { ProgressCards } from './lib/progress.js'
 import { Fanout } from './lib/fanout.js'
 import { installToolGuard } from './lib/guard.js'
+import { admit, isPolicyDrop } from './lib/access.js'
 import { describeCall, describeDiff, formatTokens } from './lib/present.js'
 import { dirname, sep } from 'node:path'
 import {
@@ -181,18 +182,22 @@ export async function apply(ctx, config = {}) {
   async function onMessage(data) {
     const inbound = readInboundMessage(data)
     if (!inbound) return
-    // Feishu reports sender_type as `user` or `app`; anything that is not a real
-    // user (another bot, or this app's own echo) must never open a turn.
-    if (inbound.senderType && inbound.senderType !== 'user') return
-    if (resolved.groupAllowlist.length > 0 && inbound.chatType === 'group'
-      && !resolved.groupAllowlist.includes(inbound.chatId)) return
-    if (resolved.senderAllowlist.length > 0 && !resolved.senderAllowlist.includes(inbound.senderId)) return
-
-    const isGroup = inbound.chatType === 'group'
-    if (resolved.requireMention && isGroup && inbound.mentions.length === 0) return
 
     const text = stripMentionPlaceholders(inbound.text)
-    if (!text) return
+    const decision = admit(inbound, resolved, text)
+    if (!decision.allow) {
+      // A policy rejection is worth a log line: without it, an operator whose
+      // messages are being dropped has nothing to look at. Ordinary traffic
+      // (an unmentioned group message, an empty body) is not logged.
+      if (isPolicyDrop(decision.reason)) {
+        logger.info(
+          `[feishu-card] dropped a message (${decision.reason}) `
+            + `chat=${inbound.chatId} sender=${inbound.senderId}`,
+        )
+      }
+      return
+    }
+    const isGroup = inbound.chatType === 'group'
 
     const key = conversationKey(resolved.sessionScope, inbound)
     const sessionId = sessions.idFor(key)

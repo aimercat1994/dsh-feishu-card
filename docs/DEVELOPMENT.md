@@ -162,8 +162,9 @@ pnpm 会报 `ERR_PNPM_IGNORED_BUILDS: protobufjs`。这是 `@larksuiteoapi/node-
 | 项 | 状态 |
 | --- | --- |
 | 图片输入 / 文件输出 | 未实现 |
-| `denyTools` guard | 已注册但**未实测**是否真的拦住工具 |
-| `senderAllowlist` / `groupAllowlist` / `approvers` | 逻辑已写，未实测 |
+| `denyTools` guard 的运行时效果 | 逻辑已抽出为 `lib/guard.js` 并有离线覆盖；注册点覆盖两条会话路径。**但默认名单为空**（与 GUI 同权限），所以该路径从未被真实触发。要依赖它之前，把 `denyTools` 设成某个工具、发一条会用到它的消息、确认日志出现 `denied tool "x"` |
+| `senderAllowlist` / `groupAllowlist` | 逻辑已抽出为 `lib/access.js`，8 项断言覆盖空名单/匹配/不匹配/仅群/群内发送者/mention 门槛。**未在真实飞书里逐条复现**，但拒绝时会写日志 |
+| `approvers` | 逻辑已写并离线覆盖；但本部署文件策略为 `danger-full-access`，**审批从未被触发**，所以「非审批人点击被拒」这条只在代码层面成立 |
 | 审批卡片真实点击 | 本部署文件策略为 `danger-full-access`，**没有触发过审批**，所以审批路径只在离线断言和建卡层面验证过 |
 | 群聊 / `chat-thread` / `chat-sender` 作用域 | 只在私聊 `chat` 作用域实测过 |
 | `output: cot` | 未实现 |

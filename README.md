@@ -46,6 +46,9 @@
 
 **运维**
 
+- 拒绝入站消息时写日志（`senderAllowlist` / `groupAllowlist` 命中会记录 chat 与 sender），
+  被静默丢弃的消息不再是无迹可寻
+
 - 二维码扫码建应用 + 自动订阅事件与回调（免手工配置开发者后台）
 - 斜杠命令整行**委派**给宿主 `commands` 注册表（不自己重写）
 - 日志落盘 `~/.dsh/dsh-feishu-card/dsh-feishu-card.log`
@@ -195,7 +198,7 @@ node test/offline.mjs
 | --- | --- |
 | 只处理文本消息 | 图片/文件消息被忽略；图片输入与 `send_file` 尚未实现 |
 | 无 CoT 输出模式 | HFC 的 `output: cot`（飞书原生思考消息）是另一条渲染路径，未实现 |
-| `denyTools` 未实测 | guard 已注册到 agent ctx，但尚未验证真的拦住了工具 |
+| `denyTools` 的运行时效果未验证 | 逻辑已抽出并离线覆盖，注册点覆盖两条会话路径，但默认名单为空（与 GUI 同权限），因此**该路径从未被真实触发过**。要依赖它之前请先按 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) 的验证清单实测一次 |
 | 多问题逐张追问 | 一次多问按顺序发多张卡片，未合并为一张表单 |
 | 无自带 `/model` 等命令 | 设计上委派给宿主注册表；宿主未注册就没有 |
 | 无设备名册 / 跨机迁移 | 依赖 `ctx.cloud`，本部署无该服务；单机场景也无意义 |

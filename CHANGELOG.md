@@ -354,6 +354,26 @@ function volatileForm(schema) {
 
 **教训**：这个功能的失败方式是"页面能打开、只是永远在加载"，而且宿主一声不吭。我绕了两轮才想到去看投影函数——**应该先读宿主怎么决定"显示什么"，再写"显示什么"**。
 
+
+### 修：volatile 字段是**引用**，不是值（`cwd=[object Object]`）
+
+标记 volatile 之后立刻出现新回归：启动日志里 `cwd=[object Object]`，工作区归档报 `The "path" argument must be of type string. Received an instance of Object`。
+
+原因：**volatile 字段校验后不是普通值，而是引用节点**。loader 为了让活 schema 可被原地改写，给 volatile 字段发的是 `{get, set}` 引用；所以读 `config.cwd` 拿到的是对象，不是路径。宿主的 `dsh-settings` 自己就用 `plainConfig()` 解包——插件跳过这一步就会到处看到引用。
+
+`plainConfig` 的判定是 `write in value`，而那个 `write` 是 `Symbol.for("cosmokit.volatile.write")`——**全局注册符号**，注释写明用途是"Identify references across ESM/CJS copies"。所以本插件可以精确复刻这套判定，而不必依赖一个解析不到的包（`@deepseek-ai/cosmokit` 不在本插件的解析链上）。
+
+修法：`resolveConfig` 入口处先 `plainConfig(rawConfig)`，之后所有消费者照旧拿普通值。新增 5 条断言，其中一条是端到端的：`resolveConfig(Config({}))` 的每个字段都必须是普通类型、且序列化后不含 `[object Object]`——正是这条本该在上一轮就拦住回归。
+
+断言 168 → 173。
+
+**这一轮的两个教训**：① 该先读宿主**怎么决定显示什么**，再写显示什么；② 宿主的"可实时应用"配置不是值而是引用——文档里没有，但 `dsh-settings` 的 `plainConfig` 就是答案，找现成实现比读文档快。
+
+
+---
+
+## 未完成
+
 - `send_file` 拒绝路径的真实触发（实测时 agent 走了"复制进工作区再发"的路线）
 - `denyTools` 守卫与 `approvers` 的运行时实测（两处都需要一个能真实触发它们的场景）
 - `output: cot`（飞书原生思考消息）模式

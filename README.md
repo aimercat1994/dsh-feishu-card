@@ -92,20 +92,46 @@ Node 18+、一个可用的 DSH profile。飞书侧**不需要手工配置**—�
 
 ## 安装
 
-```bash
-# 1) 先装插件自己的依赖
-#    注意：以 link: 方式装入 profile 时 pnpm 不会安装插件自身的依赖，
-#    缺少 node_modules 会表现为 "entry failed to import" / inactive。
-cd dsh-feishu-card
-pnpm install --prod
+**一步装好，依赖会自动带上**（已实测：从 GitHub 安装会把本插件的三个依赖一并装好，插件能直接加载）：
 
-# 2) 装入 profile
-dsh plugin --profile web add /绝对路径/dsh-feishu-card
+在 Harness 的**插件管理界面**里，用安装规格：
+
+```
+github:aimercat1994/dsh-feishu-card
 ```
 
-本仓库按 DSH bundle 约定组织：`package.json` 声明 `dsh.bundle.patch`，`cordis.patch.yml` 插入一行 `feishu-card`。
+装完**重启一次 Harness**（模块在启动时加载）。
 
-> pnpm 会报 `ERR_PNPM_IGNORED_BUILDS: protobufjs`。这是 `protobufjs` 的 postinstall（只打印一句捐赠提示）被 pnpm 安全策略拦下，**不影响使用**。要消除告警：`pnpm approve-builds`。
+### 等价的命令行做法
+
+在 profile 目录里执行：
+
+```bash
+pnpm add github:aimercat1994/dsh-feishu-card
+```
+
+`pnpm` 会把本插件的依赖（`@larksuiteoapi/node-sdk`、`@deepseek-ai/schemastery`、`qrcode-terminal`）一起装好，然后重启 Harness 即可。**不需要**先手动 `pnpm install`。
+
+### 从本地目录安装（开发用）
+
+改代码时要走这条，因为 `link:` 指向你的工作副本，改完重启就能生效：
+
+```bash
+cd dsh-feishu-card
+pnpm install --prod          # ← 这一步只有 link: 安装才需要
+# 然后在插件管理界面把该目录作为 link 装入，或写进 profile 的 package.json：
+#   "dsh-feishu-card": "link:/绝对路径/dsh-feishu-card"
+```
+
+> ⚠️ **为什么 `link:` 需要单独装依赖**：以 `link:` 装入时，pnpm 不会安装该目录自己的依赖。缺 `node_modules` 的表现是插件 `failed to import` / 状态 `inactive`，而不是报缺哪个包——很容易误判成插件本身有问题。
+
+### 关于 pnpm 的 protobufjs 告警
+
+```
+[ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: protobufjs
+```
+
+这是 `@larksuiteoapi/node-sdk` 的传递依赖，它的 postinstall 只打印一句捐赠提示，**不影响使用**。想消掉告警：`pnpm approve-builds`。
 
 ### 首次启动：二维码建应用
 

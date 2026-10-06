@@ -240,6 +240,27 @@ agent 可以把工作区里的文件作为附件发到当前会话。
 
 **另一处仍未验证**：拒绝路径从未在真实链路触发过（agent 走了复制路线），目前只有离线断言。
 
+### 安装说明修正：把开发步骤当成了安装步骤
+
+用户反馈"GitHub 上的安装方式太复杂"。查下来是我文档写错了，而且错得具体：
+
+1. README 把 **`pnpm install --prod` 当成安装的必要步骤**——那一步其实**只对 `link:` 本地开发路径才需要**。
+2. 文档里的 `dsh plugin --profile web add …` **在这个部署里根本跑不了**：`/usr/local/bin/dsh` 这个 shim 指向不存在的 `src/deepseek-harness/apps/cli/lib/bin.js`。
+3. 这个部署真正的安装通道是**插件管理界面**（profile 里已装 `dshmarket`，一个可视化插件市场）。
+
+实测了 `github:` 规格（在隔离的临时目录里，不动现有 profile）：
+
+```
+pnpm add github:aimercat1994/dsh-feishu-card
+→ 57 个包一并装好
+→ @larksuiteoapi/node-sdk / @deepseek-ai/schemastery / qrcode-terminal 全部就位
+→ FeishuTransport 构造成功，方法齐全
+```
+
+所以**一步就能装好**，不需要先手动装依赖。README 已改为：插件管理界面填 `github:aimercat1994/dsh-feishu-card` → 重启；开发路径单列，并说明为什么只有它需要 `pnpm install`。
+
+**过程中的一个测量陷阱值得记**：我先用 `createRequire(<符号链接路径>)` 探测依赖，三个全报 `MODULE_NOT_FOUND`，差点得出"git 安装不带依赖"的错误结论。实际上 pnpm 把包放进 `.pnpm/` 虚拟存储、依赖只放在**真实路径**旁边，而 Node 解析会先 realpath——用符号链接路径做 CJS 探测是假阴性。改成直接 `import()` 一次就对了：模块加载成功，`FeishuTransport` 构造成功。
+
 ---
 
 ## 未完成

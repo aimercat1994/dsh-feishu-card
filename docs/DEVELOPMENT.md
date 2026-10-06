@@ -136,9 +136,16 @@ cd <插件目录> && pnpm install --prod
 
 pnpm 会报 `ERR_PNPM_IGNORED_BUILDS: protobufjs`。这是 `@larksuiteoapi/node-sdk` 的传递依赖，其 postinstall 只打印一句捐赠提示，**不影响使用**。要消除告警跑 `pnpm approve-builds`。
 
-### 发布到 registry 时
+### 安装方式与依赖的关系（实测）
 
-`link:` 的这两个坑只影响本地开发。若把插件发布到 npm 再 `dsh plugin add`，依赖会被正常安装。
+| 安装方式 | 依赖会装上吗 | 适用 |
+| --- | --- | --- |
+| `github:aimercat1994/dsh-feishu-card`（插件管理界面或 `pnpm add`） | ✅ 会。实测 57 个包一并装好，插件端到端加载成功 | **用户安装** |
+| `link:/本地路径` | ❌ 不会，必须自己 `pnpm install --prod` | **改代码** |
+
+原因是 `link:` 只是把目录链进去，而 git 规格是一次真正的依赖解析安装。所以上面那个"缺 node_modules"的坑**只存在于开发路径**——别把它写进面向用户的安装说明里（本项目犯过这个错：README 曾把开发步骤当成安装步骤）。
+
+> 附带一个测量陷阱：验证 git 安装是否可用时，我用 `createRequire(<符号链接路径>)` 探测依赖，得到 `MODULE_NOT_FOUND`——但插件其实**加载正常**。因为 pnpm 把包放在 `.pnpm/` 虚拟存储里、只在真实路径旁放依赖，而 Node 解析时会先 realpath。**用符号链接路径做 CJS 探测会给出假阴性**；要判断"能不能用"，直接 `import()` 一次比探测解析更可靠。
 
 ---
 

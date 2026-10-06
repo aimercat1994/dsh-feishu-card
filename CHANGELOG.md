@@ -473,6 +473,34 @@ Cordis 里 `ctx.config` **需要插件在 `inject` 里声明**才能访问；我
 
 ## 未完成
 
+
+### 修：回读配置把**凭据擦掉了**——第一条消息就断线
+
+上一轮修完 `ctx.config` 之后，启动日志里又出现 `reconnect → startChannel` 失败。根因比 inject 那个更深：
+
+`resolved` **不只是 config**。它是「config → 磁盘凭据 → 已解析工作区」三层叠出来的。启动时 config 里没有 appId/appSecret，凭据是从 `credentials.json` 读进来补上的。而 `refreshSettings` 却用 `resolveConfig(config)` **整体替换**了 `resolved`——于是：
+
+1. 重新解析后 `appId` 变回 `''`
+2. 差异比较认为"凭据变了"
+3. 触发 `reconnect()`，用**空凭据**重建长连接
+4. 连接死掉，飞书那边彻底沉默
+
+所以**第一条入站消息就会把通道弄断**。两处修：
+
+- 抽出 `withStoredCredentials(base, stored)` 到 `lib/config.js`，初始解析与回读**共用同一条规则**（config 优先，否则用磁盘凭据）——两个调用点各写一份迟早会不一致
+- `reconnect()` 在无可用凭据时**直接拒绝**并告警：一次设置编辑不该变成一次断线
+
+新增 4 条断言，其中一条正是这个回归：`withStoredCredentials(resolveConfig({}), stored)` 必须仍然有凭据。
+
+**教训**：`resolved` 这种"多层叠加后的结果"不能当基线去覆盖。**凡是重新计算，都要先问它是不是同一个东西**——这次不是，config 只是其中一层。
+
+断言 176 → 180。
+
+
+---
+
+## 未完成
+
 - `send_file` 拒绝路径的真实触发（实测时 agent 走了"复制进工作区再发"的路线）
 - `denyTools` 守卫与 `approvers` 的运行时实测（两处都需要一个能真实触发它们的场景）
 - `output: cot`（飞书原生思考消息）模式

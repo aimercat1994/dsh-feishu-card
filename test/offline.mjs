@@ -35,7 +35,15 @@ import { REACTION, ReactionTracker } from '../lib/react.js'
 import { FeishuTransport } from '../lib/feishu.js'
 import { Notices, compactionFailedLine, jobLine, pressureLine, retryLine } from '../lib/notice.js'
 import { PROGRESS_ELEMENTS, ProgressCards, goalCard, todoCard } from '../lib/progress.js'
-import { Config, SETTINGS_NAMESPACE, isVolatileRef, plainConfig, resolveConfig } from '../lib/config.js'
+import {
+  Config,
+  SETTINGS_NAMESPACE,
+  hasCredentials,
+  isVolatileRef,
+  plainConfig,
+  resolveConfig,
+  withStoredCredentials,
+} from '../lib/config.js'
 import { Fanout, agentEndLine, agentStartLine, runEndLine, runStartLine, subagentLine } from '../lib/fanout.js'
 import { DENIAL_REASON, denialReason, installToolGuard } from '../lib/guard.js'
 import { DROP, admit, isPolicyDrop } from '../lib/access.js'
@@ -1718,6 +1726,33 @@ async function main() {
     assert.equal(resolved.cwd, '/tmp/x')
     assert.equal(resolved.images, false)
     assert.equal(resolved.sessionScope, 'chat')
+  })
+
+  console.log('credential layering')
+  const stored = { appId: 'cli_stored', appSecret: 'secret_stored', domain: 'https://open.larksuite.com' }
+
+  await check('config credentials win over the stored app', () => {
+    const out = withStoredCredentials({ appId: 'cli_cfg', appSecret: 's_cfg', domain: '' }, stored)
+    assert.equal(out.appId, 'cli_cfg')
+    assert.equal(out.domain, '')
+  })
+  await check('a config without credentials keeps the stored app', () => {
+    const out = withStoredCredentials({ appId: '', appSecret: '', domain: '' }, stored)
+    assert.equal(out.appId, 'cli_stored')
+    assert.equal(out.appSecret, 'secret_stored')
+    assert.equal(out.domain, 'https://open.larksuite.com')
+  })
+  await check('no stored app leaves the config alone', () => {
+    const out = withStoredCredentials({ appId: '', appSecret: '' }, undefined)
+    assert.equal(hasCredentials(out), false)
+  })
+  await check('RE-READING the config must not look like the credentials vanished', () => {
+    // This is the regression that took the channel down: `refreshSettings` replaced
+    // `resolved` with a bare re-resolve, so the stored app disappeared, the diff
+    // looked like a credential change, and the reconnect used an empty app id.
+    const reread = withStoredCredentials(resolveConfig({}), stored)
+    assert.equal(hasCredentials(reread), true, 'the stored app must survive a re-read')
+    assert.equal(reread.appId, 'cli_stored')
   })
 
   console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)

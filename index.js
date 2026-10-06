@@ -11,7 +11,13 @@
  * @module dsh-feishu-card
  */
 
-import { Config, SETTINGS_NAMESPACE, hasCredentials, resolveConfig } from './lib/config.js'
+import {
+  Config,
+  SETTINGS_NAMESPACE,
+  hasCredentials,
+  resolveConfig,
+  withStoredCredentials,
+} from './lib/config.js'
 import { FeishuTransport, readCardAction, readInboundMessage } from './lib/feishu.js'
 import { TurnRenderer } from './lib/turn.js'
 import { ConversationSessions, conversationKey, makeWorkspaceFiler } from './lib/session.js'
@@ -97,15 +103,22 @@ export async function apply(ctx, config = {}) {
 
   // Credentials: entry config (patch/env) wins, then the stored app, then the
   // QR flow. A half-configured pair is treated as unconfigured.
+  /**
+   * Credentials the profile config did NOT supply, kept so that re-reading the
+   * config cannot drop them.
+   *
+   * `resolved` is not just the config: it is the config layered over the stored
+   * app and the resolved workspace. Re-reading the config alone therefore looks
+   * like "the credentials disappeared", and acting on that difference tears down
+   * a working connection. (It did: the first inbound message reconnected with an
+   * empty app id and the channel went silent.)
+   */
+  let storedCredentials
   if (!hasCredentials(resolved)) {
     const stored = await store.load()
     if (stored) {
-      resolved = {
-        ...resolved,
-        appId: stored.appId,
-        appSecret: stored.appSecret,
-        domain: stored.domain || resolved.domain,
-      }
+      storedCredentials = stored
+      resolved = withStoredCredentials(resolved, storedCredentials)
     }
   }
 
@@ -937,7 +950,10 @@ export async function apply(ctx, config = {}) {
       // "cannot get property \"config\" without inject" for a plugin that did not
       // declare it, and the apply argument is the same object the loader mutates
       // for volatile fields anyway.
-      const next = resolveConfig(config)
+      // Layered exactly like the initial resolve: the config, over the stored app,
+      // over the workspace we already resolved. Replacing `resolved` wholesale
+      // would drop the two values the config does not carry.
+      const next = withStoredCredentials(resolveConfig(config), storedCredentials)
       // `next.cwd` is the CONFIGURED value; the resolved workspace is ours to keep.
       const candidate = { ...next, cwd: resolved.cwd }
       if (JSON.stringify(candidate) === JSON.stringify(resolved)) return false
@@ -986,6 +1002,12 @@ export async function apply(ctx, config = {}) {
 
   /** Rebuild the long connection after a live credential change. */
   async function reconnect() {
+    if (!hasCredentials(resolved)) {
+      // Nothing to connect with; dropping the live connection here would turn a
+      // settings edit into an outage.
+      logger.warn('[feishu-card] not reconnecting: no usable credentials')
+      return
+    }
     try {
       await transport.stop()
       transport.updateCredentials({
@@ -1029,6 +1051,7 @@ export async function apply(ctx, config = {}) {
         return
       }
       if (disposed) return
+      storedCredentials = { appId: onboarded.appId, appSecret: onboarded.appSecret }
       resolved = { ...resolved, appId: onboarded.appId, appSecret: onboarded.appSecret }
       transport.updateCredentials({ appId: onboarded.appId, appSecret: onboarded.appSecret })
       await startChannel()

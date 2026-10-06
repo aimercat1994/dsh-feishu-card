@@ -80,6 +80,33 @@ import('./lib/card.js').then(async (m)=>{
 
 ---
 
+## 验证浏览器一半（无浏览器时）
+
+本部署没有可用的浏览器（Electron 未安装），但客户端一半的**投递链路**可以纯命令行验证。宿主把客户端模块图注入首页的 `__DSH_BOOT__`：
+
+```bash
+# 1) 首页需要认证：从日志里取带 token 的 URL，走一次 cookie 流程
+TOKEN=$(grep -rhoE 'http://127\.0\.0\.1:2298/\?token=[A-Za-z0-9_-]+' $DSH_HOME/dsh-web.log | tail -1 | sed 's/.*token=//')
+curl -s -c /tmp/jar -b /tmp/jar -o /tmp/index.html "http://127.0.0.1:2298/?token=$TOKEN"
+curl -s -b /tmp/jar -o /tmp/index.html "http://127.0.0.1:2298/"
+
+# 2) 在注入的模块图里找自己的条目（这一步就是"宿主是否发现了我的客户端一半"）
+python3 -c "
+import re,json,html
+src=open('/tmp/index.html',encoding='utf-8').read()
+boot=json.loads(html.unescape(re.search(r'__DSH_BOOT__\"\] = (\{.*?\});',src,re.S).group(1)))
+for e in boot['entries']:
+    if 'feishu' in e['id']: print(e['id'], e['url'])
+"
+
+# 3) 取那个 URL，确认真的能取到
+curl -s -b /tmp/jar -o /tmp/served.js "http://127.0.0.1:2298/<url>"
+```
+
+服务端**原样**提供 `exports["./client"]`，只追加一行 `sourceMappingURL`——所以 `diff` 只该看到那一行。
+
+**这一步抓得到什么**：客户端一半没被发现（`dsh.client` 写错、`exports["./client"]` 指错）、注册的 slot 名或 row key 不对（那会让"配置"按钮永远不出现，而且没有任何报错）。**抓不到什么**：渲染出来的样子、点击行为、`form.mutate` 是否真的写进 profile。那些只能靠人在浏览器里看。
+
 ## 加一个功能
 
 按 `ARCHITECTURE.md` 第 7 节的扩展点走。通用流程：

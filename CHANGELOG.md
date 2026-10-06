@@ -273,9 +273,21 @@ pnpm add github:aimercat1994/dsh-feishu-card
 
 Release 说明里专门列了「**未验证**」那一节（`denyTools` 运行时、`approvers`、`send_file` 拒绝路径、群聊作用域），因为开发过程中被"看起来在工作、其实没有"坑过三次——把没验证的说成验证过的，正是那种坑的成因。
 
----
+### 设置界面（插件管理页里的配置表单）
 
-## 未完成
+用户要求在内置插件界面里配置本插件（默认工作区、飞书连接等）。
+
+**先搞清机制，再动手。** 调查结论：设置页渲染的是"由 Host 插件注册的分区"，而插件管理页的 `plugins.row.config` 是一个 **keyed slot**，key 为 `<包名>#<rowId>`；管理页只**声明**这个 slot，配置页必须由插件自己的客户端一半注册。所以这不是"填个 schema 就有了"，而是需要写浏览器一半。
+
+**宿主侧**：27 个配置项全部补上 `.description()`。设置页是 schema 驱动的，**没有 description 的字段会渲染成一个没有标签的输入框**——这是之前完全没有的东西。
+
+**客户端侧**（新增 `client/client.js`）：手写、免构建，宿主原样提供 `exports["./client"]`；直接用 `React.createElement`，避免存在一个会被忘记运行的转换步骤。注册 `plugins.row.config`，处理 owner 传入的两种视图（`summary` 卡片一行 / `page` 表单）。表单**按语义分组**而不是把校验用的 schema 直接铺开——那个 schema 是深层的 `anyOf` + loader 表达式，铺成表单没法用。密文字段按 `RedactedSecret`（`{path,set}`）处理，留空即不修改；改动收集成 ops 一次性 `form.mutate`，带 revision 栅栏。
+
+**验证方式**（无浏览器）：宿主把客户端模块图注入首页的 `__DSH_BOOT__`。解析它 → 我的条目在 75 个条目里、url 为 `plugins/??dsh-feishu-card/client.js&rev=…` → 取该 URL 得 HTTP 200 且内容**逐字节等于**源文件（只多一行 sourcemap 引用）。链路成立。**渲染效果与写入行为仍未验证**——没有浏览器，这两项只能由人看。
+
+**测试新增 5 项**：客户端声明、row key 与 patch 行 id 一致、slot 名、两种视图、module loader 形态。row key 不匹配的失败形式是"配置按钮永远不出现"，静默且其他断言都看不见。
+
+断言 157 → 162。
 
 - `send_file` 拒绝路径的真实触发（实测时 agent 走了"复制进工作区再发"的路线）
 - `denyTools` 守卫与 `approvers` 的运行时实测

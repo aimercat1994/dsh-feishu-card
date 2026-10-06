@@ -1,0 +1,28 @@
+{
+  "name": "dsh-feishu-card",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Hermes-style streaming interactive Feishu/Lark cards for DeepSeek Harness sessions.",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "@larksuiteoapi/node-sdk": "^1.74.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

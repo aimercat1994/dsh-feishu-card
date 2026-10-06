@@ -1,0 +1,169 @@
+# 开发
+
+## 仓库布局
+
+```
+index.js               入口（唯一接线层）
+lib/*.js               见 ARCHITECTURE.md 的模块地图
+test/offline.mjs       102 项离线断言，不连飞书
+cordis.patch.yml       bundle patch：插入 feishu-card 这一行
+package.json           声明 dsh.bundle.patch 与依赖
+docs/                  本目录
+```
+
+## 本地迭代
+
+### 改代码之后必须重启 Harness
+
+**禁用/启用插件不会重新加载代码。** Node 按路径缓存 ES module，toggle 之后 `import()` 拿到的还是旧模块。症状是"改动毫无反应"——本项目在这上面浪费过一整轮：以为 Config schema 没生效，其实跑的是上一版代码。
+
+- 改 `.js` → **必须重启**整个 Harness 进程
+- 改 `cordis.patch.yml` 的 `config` → 同样需要重启（或用 Plugin Manager 的 set 操作触发重新挂载，但那不一定重载模块）
+
+### 运行离线测试
+
+```bash
+node test/offline.mjs
+```
+
+它不连飞书、不需要凭据，纯逻辑断言。**每次改完都该跑。** 覆盖范围见 README。
+
+### 看日志
+
+```bash
+tail -f ~/.dsh/dsh-feishu-card/dsh-feishu-card.log
+```
+
+控制台与文件双写（`lib/log.js`）。**为什么必须有文件**：本部署的 harness 控制台是一个由监管进程持有的管道，stdout 拿不到；只写 stdout 的插件的失败是**无法事后诊断**的。这条是踩过的教训：早期所有卡片错误都只进 stdout，导致"用户说什么都没收到"时完全无从下手。
+
+日志里会带平台返回的原文（`code` / `msg` / 出错元素路径），这是定位卡片问题的主要手段。
+
+---
+
+## 对真实 API 验证卡片形状
+
+**这是本项目最重要的开发纪律。** 离线测试无法证明平台会接受一张卡片——`action` 标签事件就是这么漏出去的。
+
+模式是从凭据直接打 Open API，把要验证的形状逐个建卡，读返回的 `code`：
+
+```bash
+node -e "
+const fs=require('fs');
+import('./lib/card.js').then(async (m)=>{
+  const c = JSON.parse(fs.readFileSync(process.env.HOME+'/.dsh/dsh-feishu-card/credentials.json','utf8'));
+  const tok = await (await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',{
+    method:'POST', headers:{'Content-Type':'application/json; charset=utf-8'},
+    body: JSON.stringify({app_id:c.appId, app_secret:c.appSecret})})).json();
+  const H = {Authorization:'Bearer '+tok.tenant_access_token,'Content-Type':'application/json; charset=utf-8'};
+  const cards = {
+    'turn classic': m.buildTurnCard({title:'DSH', preset:'classic'}),
+    'decision'    : m.buildDecisionCard({title:'t', body:'b', id:'x'}),
+  };
+  for (const [name, card] of Object.entries(cards)) {
+    const bad = m.invalidElementIds(card);
+    const r = await (await fetch('https://open.feishu.cn/open-apis/cardkit/v1/cards',{
+      method:'POST', headers:H, body: JSON.stringify({type:'card_json', data: JSON.stringify(card)})})).json();
+    console.log(name.padEnd(16), 'ids:'+(bad.length||'ok'), r.code===0?'OK':'FAIL '+JSON.stringify(r).slice(0,180));
+  }
+});
+"
+```
+
+**加一个新元素、新预设、新卡片类型时，先这样验一遍再发。**
+
+往已有卡片流式写入也要验（`cardElement.content` 的行为与建卡不同）：
+
+```bash
+# 建卡后 PUT /open-apis/cardkit/v1/cards/{card_id}/elements/{element_id}/content
+# body: {"content":"...","sequence":<递增>}
+```
+
+---
+
+## 加一个功能
+
+按 `ARCHITECTURE.md` 第 7 节的扩展点走。通用流程：
+
+1. **先确认宿主契约**：要订阅的事件真的存在吗？模式（waterfall / emit / serial）是什么？async 吗？服务方法签名是什么？
+   - `cordis_inspect_query`（`Event` / `Service` provider）是权威
+   - 类型定义在 `node_modules/@deepseek-ai/*/lib/types/`
+2. **把纯逻辑放进独立模块**（像 `present.js` / `notice.js` / `fanout.js` 那样），这样能离线测试
+3. **在 `index.js` 接线**
+4. **补离线断言**
+5. **对真实 API 验证卡片形状**（若涉及新元素）
+6. **重启并观察日志**
+
+### 枚举 DSH 事件类型的坑
+
+`dsh-session` 自己的 `SessionEventMap` **不是全集**。`todo/write`、`tool-workflow/*`、`subagent/*`、`goal/change` 都是由各自的工具包通过 **module augmentation** 声明的。
+
+```bash
+# 找全所有会话事件类型
+grep -rn -A12 'interface SessionEventMap' node_modules/@deepseek-ai/*/lib/types/*.d.ts
+```
+
+只读宿主包一定会漏。
+
+### waterfall 的规矩
+
+注册在别人的 waterfall 上时：
+
+- **纯观察者必须 `next()`**，否则会吞掉宿主或其他插件的处理
+- 注意模式：`compaction/summary-error` 是**同步** waterfall（返回 boolean），里面有异步工作只能 fire-and-forget
+- 监听器里的异常要自己接住；抛进宿主的事件分发路径会波及整个回合
+
+---
+
+## 安装 / 升级的坑
+
+### `link:` 安装不装依赖
+
+`install_bundle` 会以 `link:` 方式把本地目录链进 profile，pnpm **不会**安装插件自身的依赖。表现是：
+
+```
+feishu-card (dsh-feishu-card): failed to import
+```
+
+状态显示 `inactive`。解决：
+
+```bash
+cd <插件目录> && pnpm install --prod
+```
+
+（这一步过后 toggle 一下或重启即可。）
+
+### `protobufjs` 的构建脚本
+
+pnpm 会报 `ERR_PNPM_IGNORED_BUILDS: protobufjs`。这是 `@larksuiteoapi/node-sdk` 的传递依赖，其 postinstall 只打印一句捐赠提示，**不影响使用**。要消除告警跑 `pnpm approve-builds`。
+
+### 发布到 registry 时
+
+`link:` 的这两个坑只影响本地开发。若把插件发布到 npm 再 `dsh plugin add`，依赖会被正常安装。
+
+---
+
+## 验证清单
+
+交付/发布前：
+
+- [ ] `node test/offline.mjs` 全过
+- [ ] 所有卡片形状对真实 API 建卡成功
+- [ ] 插件状态 `active`（Plugin Manager 或 `Config.listConfigs` 有 `feishu-card`）
+- [ ] 日志出现 `using workspace as cwd` + `active` + `connected to Feishu`
+- [ ] 真实飞书里跑一遍：发消息 → 卡片流式 → 结束态；提问 → 选项按钮 → 回执；`/new`；`/status`
+- [ ] 若改了反应/进度卡/扇出，对应路径也走一遍
+
+---
+
+## 已知的验证缺口
+
+诚实列出，接手时不要以为都验过：
+
+| 项 | 状态 |
+| --- | --- |
+| 图片输入 / 文件输出 | 未实现 |
+| `denyTools` guard | 已注册但**未实测**是否真的拦住工具 |
+| `senderAllowlist` / `groupAllowlist` / `approvers` | 逻辑已写，未实测 |
+| 审批卡片真实点击 | 本部署文件策略为 `danger-full-access`，**没有触发过审批**，所以审批路径只在离线断言和建卡层面验证过 |
+| 群聊 / `chat-thread` / `chat-sender` 作用域 | 只在私聊 `chat` 作用域实测过 |
+| `output: cot` | 未实现 |

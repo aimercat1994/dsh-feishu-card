@@ -1,0 +1,214 @@
+# dsh-feishu-card
+
+> 把 DeepSeek Harness 的每个回合，变成飞书 / Lark 里一张持续更新的交互卡片。
+
+这是 [hermes-feishu-streaming-card](https://github.com/baileyh8/hermes-feishu-streaming-card)（下称 **HFC**）的卡片体验在 **DSH 上的独立重写**：不是移植代码，而是把 HFC 的卡片信息架构重新实现为一个 DSH Host 插件。
+
+**关键差别是架构。** HFC 需要在 Hermes 源码里打 17 个补丁并跑一个独立 sidecar 进程（约 64k 行基建：安装器、源码补丁、HMAC 事件鉴权、pidfile、systemd/s6/Docker 管理）。DSH 把同样的事件与交互都做成了原生 Event/Service，所以本插件是一个**同进程 Host 插件**：
+
+- 不打补丁、不改宿主源码
+- 没有 sidecar 进程、没有 IPC、没有 HMAC 传输层
+- 不需要公网 callback URL（入站事件走应用的 WebSocket 长连接）
+- 不需要进程 / 服务管理
+
+| | HFC | dsh-feishu-card |
+| --- | --- | --- |
+| 形态 | Python sidecar + 源码补丁 | 同进程 JS Host 插件 |
+| 事件来源 | 补丁进 Hermes 的 hook | `session/event` 等原生事件 |
+| 审批 / 提问 | hook 轮询 `/interactions/{id}` | 原生 waterfall，直接返回结果 |
+| 会话持久化 | sidecar 自己的检查点 | 宿主 session store（id 确定性派生） |
+| 代码量 | 75,092 行 Python | 约 3,600 行 JS |
+
+## 功能
+
+**卡片**
+
+- 一个回合一张卡片：头部（状态 + 实时动作一行）→ 正文 → 可折叠过程面板 → 页脚统计
+- 思考与工具动作在**可折叠面板**里；正文永远在上（读者要的是答案）
+- 工具动作按族分类带图标（📖 读取 / ✏️ 编辑 / 🔍 搜索 / ⚡ 执行 / 🌐 网络…）并带上目标文件
+- 编辑类工具直接渲染 ```diff 块
+- 四种阅读预设：`classic` / `focused` / `detailed` / `task`
+- 页脚：耗时 · 工具次数 · 模型 · ↑输入 ↓输出 tokens
+- `widthMode`（default/compact/fill）与逐区域 `textSizes`
+
+**交互**
+
+- 审批与提问**内嵌在同一张回合卡里**（正文下方、页脚上方），点选后原位留回执
+- 提问三条件作答路径：选项按钮 / 直接回复文字 / 卡片内输入框（opt-in）
+- 审批只认按钮
+
+**状态**
+
+- 用户消息上的反应反馈：`OK` → `THINKING` → `DONE` / `ERROR`
+- 通知：模型重试、上下文用量、压缩失败、后台任务结束
+- todo 与 goal **各占一张独立卡片、跨回合存活**；goal 按钮真正调用 `ctx.goals`
+- 工作流 / 子代理扇出叙述
+
+**运维**
+
+- 二维码扫码建应用 + 自动订阅事件与回调（免手工配置开发者后台）
+- 斜杠命令整行**委派**给宿主 `commands` 注册表（不自己重写）
+- 日志落盘 `~/.dsh/dsh-feishu-card/dsh-feishu-card.log`
+- 卡片路径失败时降级为纯文本，不会静默失败
+
+## 前置条件
+
+Node 18+、一个可用的 DSH profile。飞书侧**不需要手工配置**——首次启动走二维码注册流程。
+
+若你更愿意手工建应用：
+
+1. 启用**机器人**能力
+2. **事件订阅**使用**长连接**（WebSocket）模式，不要填 HTTP 回调地址
+3. 订阅事件 `im.message.receive_v1`
+4. 订阅回调 `card.action.trigger`
+5. 权限：`im:message`、`im:message:send_as_bot`、`im:message:readonly`、`im:resource`、`im:chat:read`、`im:message.reactions`
+6. 把机器人加进目标群，或允许私聊
+
+> ⚠️ **同一个飞书应用只能有一条长连接。** 如果同时启用了别的飞书渠道（例如 `@moyu-good/dsh-lark-bridge`），两者会争抢同一个应用的入站事件——**必须禁用其中一个**，或使用两个不同的应用。
+
+## 安装
+
+```bash
+# 1) 先装插件自己的依赖
+#    注意：以 link: 方式装入 profile 时 pnpm 不会安装插件自身的依赖，
+#    缺少 node_modules 会表现为 "entry failed to import" / inactive。
+cd dsh-feishu-card
+pnpm install --prod
+
+# 2) 装入 profile
+dsh plugin --profile web add /绝对路径/dsh-feishu-card
+```
+
+本仓库按 DSH bundle 约定组织：`package.json` 声明 `dsh.bundle.patch`，`cordis.patch.yml` 插入一行 `feishu-card`。
+
+> pnpm 会报 `ERR_PNPM_IGNORED_BUILDS: protobufjs`。这是 `protobufjs` 的 postinstall（只打印一句捐赠提示）被 pnpm 安全策略拦下，**不影响使用**。要消除告警：`pnpm approve-builds`。
+
+### 首次启动：二维码建应用
+
+没有凭据时插件会打印一条注册 URL，并写到 `~/.dsh/dsh-feishu-card/onboarding-url.txt`：
+
+```
+用飞书扫码（约 600s 内有效）：
+https://open.feishu.cn/page/launcher?user_code=XXXX-XXXX&...
+```
+
+扫码确认后，凭据以 **0600** 权限写入 `~/.dsh/dsh-feishu-card/credentials.json`，插件自动连上。二维码过期会自动重发。日志出现 `connected to Feishu` 即成功。
+
+### 改完代码必须重启 Harness
+
+**禁用/启用插件不会重新加载代码。** Node 按路径缓存 ES module，toggle 之后仍跑旧模块（表现为改动毫无反应、配置项不生效）。这是本项目开发中踩过最久的坑，详见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
+
+## 配置
+
+优先级：**行 config** > 进程环境变量。两者都没有且本地也无凭据时进入二维码流程。
+
+环境变量：
+
+```dotenv
+FEISHU_APP_ID=cli_xxx
+FEISHU_APP_SECRET=xxx
+FEISHU_DOMAIN=              # 国际版 Lark 填 https://open.larksuite.com
+```
+
+或在 profile 的 `cordis.patch.yml` 覆盖该行 config：
+
+```yaml
+- id: feishu-card
+  config:
+    appId: cli_xxx
+    appSecret: xxx
+    cwd: /absolute/workspace             # 新会话的工作目录
+    sessionScope: chat                   # chat | chat-thread | chat-sender
+    locale: auto                         # auto | zh | en
+    requireMention: true                 # 群里是否需要 @机器人
+
+    # 授权收窄
+    senderAllowlist: []                  # 私聊白名单（open_id）
+    groupAllowlist: []                   # 群白名单（chat_id）
+    approvers: []                        # 谁可以点审批按钮；留空=按上面两条规则
+    denyTools: []                        # 在飞书渠道禁用的工具名
+
+    # 渲染
+    readingPreset: classic               # classic | focused | detailed | task
+    showProcess: true                    # 是否显示过程面板
+    hideProcessWhenDone: false           # 回合结束后强制折叠过程面板
+    widthMode: default                   # default | compact | fill（仅 JSON 2.0 卡片）
+    flushIntervalMs: 400                 # 流式写入合并间隔
+    reasoningTail: 2000                  # 过程面板只显示思考的最后 N 字（0=不截断）
+    textSizes:
+      reasoning: notation
+      activity: notation
+      answer: normal
+      footer: notation
+
+    # 交互
+    approvalTimeoutSec: 300              # 审批/提问等待上限，超时按取消处理
+    approvalReminderMs: 0                # >0 时在卡片上追加"仍在等待"提示
+    cardInput: false                     # 是否在卡片内放输入框（默认关闭，理由见下）
+
+    # 通知与反馈
+    notices: true
+    pressureWarnTokens: 120000           # 上下文用量告警阈值
+    reactionFeedback: true               # 在用户消息上打状态表情
+
+    # 生命周期
+    autoResumeGoals: false               # 每条消息前尝试重新武装被 disarm 的 goal
+    onboarding: true                     # 无凭据时是否允许二维码建应用
+    stateDir: ~/.dsh/dsh-feishu-card
+```
+
+`cwd` 不配置时，插件会在**排除宿主自己的目录**（`$DSH_HOME`、profile 目录、运行中的 dsh 安装目录）后取第一个注册的工作区。这是刻意的：`process.cwd()` 是 harness 安装目录，把编码 agent 默认指向正在运行的 harness 是典型的自伤默认值。
+
+`cardInput` 默认关闭：飞书客户端的 `input` 元素会弹一个原生编辑面板，各端体验不一致（移动端面板偏大、确认入口不统一）。对聊天场景来说，"直接在聊天框回复"更自然，所以默认走回复路径。
+
+## 使用
+
+- 私聊直接发消息；群里需要 @机器人（受 `requireMention` 控制）
+- `/new` — 轮换 session（真正开新会话，不是清空内存映射）
+- `/status` — 查看绑定的 session 与卡片状态
+- `/stop` — 停止当前回合（在命令处理之前拦截，所以回合跑着时也有效）
+- `/help` — 列出宿主命令注册表里的命令 + 本渠道命令
+- 其余 `/xxx` 整行委派给宿主 `commands.execute`
+
+## 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 模块地图、事件/服务清单、数据流、关键不变量与设计取舍 |
+| [docs/PLATFORM-NOTES.md](docs/PLATFORM-NOTES.md) | 飞书卡片 JSON 2.0 硬约束（逐条实测）、API 清单、反应语义 |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | 本地迭代、离线测试、如何对真实 API 验证卡片、如何加功能 |
+| [CHANGELOG.md](CHANGELOG.md) | 变更历史 |
+
+## 测试
+
+```bash
+node test/offline.mjs
+```
+
+102 项断言，**不连飞书**，覆盖：卡片结构与 `element_id` 平台规则、四种阅读预设版式、流式合并与去重、已提交正文不与实时 delta 重复计、卡片创建幂等与竞态、会话键单射性、session ladder 三档阶梯、`/new` 轮换与重启持久化、命令委派与降级、工具分类与 diff 提取、反应换挡序列与终态一次性、通知阈值跨越、进度卡原位更新与过期恢复、扇出计数与畸形载荷降级。
+
+**另有真实飞书 API 验证**（需要凭据）：全部卡片形状（回合卡 ×4 预设、决策卡 ×4 形态、通知卡、进度卡 ×7）逐一建卡成功，以及"往折叠面板内部元素流式写入"这条高风险路径。验证脚本模式见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
+
+## 已知限制
+
+| 限制 | 说明 |
+| --- | --- |
+| 只处理文本消息 | 图片/文件消息被忽略；图片输入与 `send_file` 尚未实现 |
+| 无 CoT 输出模式 | HFC 的 `output: cot`（飞书原生思考消息）是另一条渲染路径，未实现 |
+| `denyTools` 未实测 | guard 已注册到 agent ctx，但尚未验证真的拦住了工具 |
+| 多问题逐张追问 | 一次多问按顺序发多张卡片，未合并为一张表单 |
+| 无自带 `/model` 等命令 | 设计上委派给宿主注册表；宿主未注册就没有 |
+| 无设备名册 / 跨机迁移 | 依赖 `ctx.cloud`，本部署无该服务；单机场景也无意义 |
+
+## 路线图
+
+1. **图片输入 / 文件输出** — 消息里的图 → `attachments.saveImage` → prompt 的 `image` part（默认关闭：不支持的模型路由会让该会话历史永久污染）；`send_file` 注册到 agent ctx + `allowedFileDirs` 白名单
+2. **`denyTools` 实测** + 授权收窄完整验证
+3. **`output: cot` 模式** — 需要飞书客户端版本门槛
+4. **多问题合并表单**
+
+## 许可证与致谢
+
+MIT，见 [LICENSE](LICENSE)。
+
+卡片信息架构、阅读预设分类、"运行中展开 / 完成折叠"的过程面板策略，以及若干**已验证的卡片元素形状**（`collapsible_panel`、`column_set` 按钮换行、`form` 提交语义）来自 MIT 许可的 [hermes-feishu-streaming-card](https://github.com/baileyh8/hermes-feishu-streaming-card)。本项目与 HFC **无代码共享**，是独立实现。

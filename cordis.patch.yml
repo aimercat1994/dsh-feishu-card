@@ -1,0 +1,26 @@
+# Bundle patch for dsh-feishu-card.
+#
+# Credentials resolve in this order: this row's config, then the process
+# environment. Without both an app id and a secret the plugin activates in a
+# degraded state: it logs one notice and opens no Feishu connection, so a
+# profile that lists this bundle still boots.
+#
+# WARNING: Feishu delivers one app's inbound events to a single long
+# connection. Do NOT run this plugin and another Feishu channel
+# (e.g. @moyu-good/dsh-lark-bridge) against the same app id at the same time —
+# disable one of them first.
+
+- insert:
+    - id: feishu-card
+      name: 'dsh-feishu-card'
+      config:
+        appId: !!js process.env.FEISHU_APP_ID
+        appSecret: !!js process.env.FEISHU_APP_SECRET
+        # domain: https://open.larksuite.com   # default is Feishu (open.feishu.cn)
+        # cwd: /absolute/workspace/path        # default is the host process cwd
+        requireMention: true
+        # State directory for the chat -> session bindings.
+        # stateDir: ~/.dsh/dsh-feishu-card
+        # approvalTimeoutSec: 300
+        # flushIntervalMs: 400
+        # allowChats: []                       # empty serves every chat the app is in

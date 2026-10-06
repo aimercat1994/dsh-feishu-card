@@ -224,7 +224,7 @@ agent 可以把工作区里的文件作为附件发到当前会话。
 
 顺带把 `agentRegistrations` 从 `sessionId → 单个 disposer` 改成 `sessionId → disposer 数组`：守卫和工具都是 per-agent 注册，单值会让后注册的覆盖掉前一个。
 
-断言 147 → 158。
+断言 147 → 157。
 
 ---
 

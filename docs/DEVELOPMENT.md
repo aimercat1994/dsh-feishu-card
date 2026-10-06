@@ -107,6 +107,16 @@ curl -s -b /tmp/jar -o /tmp/served.js "http://127.0.0.1:2298/<url>"
 
 **这一步抓得到什么**：客户端一半没被发现（`dsh.client` 写错、`exports["./client"]` 指错）、注册的 slot 名或 row key 不对（那会让"配置"按钮永远不出现，而且没有任何报错）。**抓不到什么**：渲染出来的样子、点击行为、`form.mutate` 是否真的写进 profile。那些只能靠人在浏览器里看。
 
+## 让一个插件出现在设置页
+
+要同时满足三件事，缺一件就是**静默失败**：
+
+1. **配置字段标记 `.volatile()`**——否则该字段不在投影里；一个 volatile 都没有时整条被 `settings.describe()` 跳过，命名空间到不了浏览器。
+2. **注册正确的 slot**：插件自己的设置挂 `plugins.bundle.config`（key = **包名**）；"多行 bundle 里某一个组件"的设置挂 `plugins.row.config`（key = `包名#rowId`）。
+3. **两级拿数据的方式不同**：`plugins.row.config` 由 owner 传 `form`；`plugins.bundle.config` **只传 `view`**，必须自己从 `configForms` 服务按命名空间取。命名空间是**裸 patch id**（`feishu-card`），不是 loader 目录键（`include:feishu-card`）。
+
+排查顺序建议：先看 slot 占用（`cordis_inspect_query` 的 client `Slots` → `listSubTree`，`root: plugins.bundle.config`）确认注册生效；再确认命名空间；最后才怀疑表单代码。**"命名空间未暴露"几乎总是第 1 条。**
+
 ## 加一个功能
 
 按 `ARCHITECTURE.md` 第 7 节的扩展点走。通用流程：

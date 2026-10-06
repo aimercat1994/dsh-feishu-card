@@ -221,6 +221,12 @@ goal 卡片按钮 → `onCardAction` → `applyGoalOperation()` → **真正调�
 
 **改设置表单**：宿主侧只改 `lib/config.js`（`.description()` 就是表单里的说明）；表单本身在 `client/client.js` 的 `GROUPS` 里维护，**两处都要加**——schema 是校验契约，`GROUPS` 是给人看的。字段名两边必须一致。
 
+**一个字段必须在 schema 里标记为 `.volatile()`，否则它在设置页里根本不存在。** 宿主把插件的 Config 投影成"可实时应用的字段"（`dsh-settings` 的 `volatileForm`），**其余字段一律丢弃**；如果没有任何 volatile 字段，投影返回 `undefined`，该条目被 `settings.describe()` 跳过，命名空间永远到不了浏览器，页面只能报"命名空间未暴露"——**而且不产生任何日志**。所以 `.volatile()` 不是可选修饰，它是设置页存在的前提。
+
+volatile 同时也是字面意思：loader 把新值**原地写进活 schema** 并发出 `loader/volatile-update`，**不重启插件**。所以插件必须监听该事件重新读取配置，否则 UI 显示新值、行为还是旧值。
+
+`lib/config.js` 里 `stateDir` 与 `onboarding` 刻意**不**标记 volatile：它们在挂载时读取一次，做成实时设置是撒谎。代价是它们不出现在设置页——这是有意的取舍，不是遗漏。
+
 关于设置页挂在哪一级，三条约束都是从宿主源码读出来的，不是猜的：
 
 | | 值 | 依据 |

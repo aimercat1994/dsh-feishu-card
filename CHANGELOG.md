@@ -320,9 +320,39 @@ const listed = { id: entry.id, patchId: id, name };   // patchId = entry.options
 
 断言 162 → 164（新增：bundle 级 + 包名 key、命名空间必须是裸 patch id、必须自取表单）。
 
----
+### 修：设置页的根因——只有 volatile 字段会出现在表单里
 
-## 未完成
+上一步改成 bundle 级、自取表单之后，用户看到的仍然是我的诊断文案：`没有拿到配置表单：客户端未暴露命名空间 "feishu-card"`。这条文案（把三种失败态拆开）直接把我引到了正确的地方。
+
+**根因在 `dsh-settings` 的投影函数里：**
+
+```js
+function volatileForm(schema) {
+  if (schema.meta.volatile) return plainSchema(schema);
+  if (schema.type === 'object') {
+    const dict = Object.fromEntries(Object.entries(schema.dict ?? {}).flatMap(([key, child]) => {
+      const field = volatileForm(child);
+      return field === void 0 ? [] : [[key, field]];   // 非 volatile 字段被丢弃
+    }));
+    return Object.keys(dict).length === 0 ? void 0 : z.object(dict);   // 空 → 整条被跳过
+  }
+}
+```
+
+宿主只投影**可实时应用的字段**。我的 schema 一个 `.volatile()` 都没有 → 投影返回 `undefined` → `describe()` 跳过该条目 → 命名空间永远到不了浏览器。**而且全程没有任何日志。**
+
+**volatile 是字面意思**：loader 的 `_commitVolatile()` 把新值原地写进活 schema，然后发出 `loader/volatile-update`，**不重启插件**。参照实现 dsh-mnemon 正是这么做：把字段逐个 `.volatile()`，再监听该事件。
+
+**修法**（照参照实现）：
+
+- `lib/config.js`：除 `stateDir` 与 `onboarding` 外全部标记 volatile。这两项在挂载时读取一次（日志文件、凭据存储、二维码流程），做成"实时设置"是承诺一个做不到的效果——代价是它们不出现在设置页，这是有意取舍
+- `index.js`：监听 `loader/volatile-update`，重新 `resolveConfig`。凭据变更**重建长连接**（`transport.stop()` → `updateCredentials` → `startChannel()`），`cwd` 变更重建 workspace filer 让**新会话**用新目录；其余字段本来就按次读取，自动生效
+
+**顺带被新断言抓到一个真问题**：我的表单里放了 `stateDir` 和 `onboarding`，但它们在投影里不存在——控件会显示空白、保存的值永远读不回来。已从表单移除，并加了一条断言：**表单字段集合必须恰好等于 schema 的 volatile 字段集合**。这条断言当场又抓出 `maxFileBytes` 有 schema、无控件。
+
+断言 164 → 168（新增：字段必须是 volatile 或已登记的挂载期字段、volatile 数量下限、每个字段必须有 description、表单与 volatile 集合一致、插件必须监听 volatile-update）。
+
+**教训**：这个功能的失败方式是"页面能打开、只是永远在加载"，而且宿主一声不吭。我绕了两轮才想到去看投影函数——**应该先读宿主怎么决定"显示什么"，再写"显示什么"**。
 
 - `send_file` 拒绝路径的真实触发（实测时 agent 走了"复制进工作区再发"的路线）
 - `denyTools` 守卫与 `approvers` 的运行时实测（两处都需要一个能真实触发它们的场景）

@@ -128,6 +128,7 @@ window.__ModuleLoader__.load({
             kind: 'list',
             hint: '每行一个绝对路径。注意这**不是安全边界**：agent 可以把文件复制进工作区再发。',
           },
+          { name: 'maxFileBytes', label: '发送文件大小上限（字节）', kind: 'number', min: 1 },
         ],
       },
       {
@@ -202,12 +203,14 @@ window.__ModuleLoader__.load({
       },
       {
         title: '通知与生命周期',
+        // `stateDir` and `onboarding` are deliberately absent: both are read once
+        // while the plugin mounts, so they are not volatile, so the host's form
+        // does not carry them — a control here would show an empty box whose
+        // saved value could never be read back. They stay file/env-only settings.
         fields: [
           { name: 'notices', label: '重试/用量/压缩/任务通知', kind: 'boolean' },
           { name: 'pressureWarnTokens', label: '上下文用量告警阈值', kind: 'number', min: 0 },
           { name: 'autoResumeGoals', label: '自动重新武装 goal', kind: 'boolean' },
-          { name: 'onboarding', label: '允许扫码建应用', kind: 'boolean' },
-          { name: 'stateDir', label: '状态目录', kind: 'text', placeholder: '留空 = ~/.dsh/dsh-feishu-card' },
         ],
       },
     ]

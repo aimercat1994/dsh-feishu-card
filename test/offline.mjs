@@ -35,6 +35,7 @@ import { REACTION, ReactionTracker } from '../lib/react.js'
 import { FeishuTransport } from '../lib/feishu.js'
 import { Notices, compactionFailedLine, jobLine, pressureLine, retryLine } from '../lib/notice.js'
 import { PROGRESS_ELEMENTS, ProgressCards, goalCard, todoCard } from '../lib/progress.js'
+import { Config } from '../lib/config.js'
 import { Fanout, agentEndLine, agentStartLine, runEndLine, runStartLine, subagentLine } from '../lib/fanout.js'
 import { DENIAL_REASON, denialReason, installToolGuard } from '../lib/guard.js'
 import { DROP, admit, isPolicyDrop } from '../lib/access.js'
@@ -1601,6 +1602,45 @@ async function main() {
     assert.match(clientSource, /id: 'dsh-feishu-card'/)
     // Build-free: React.createElement only, so there is no transform to forget.
     assert.doesNotMatch(clientSource, /jsx>|React\.createElement\(\s*'<\//)
+  })
+
+  // The Settings page renders a plugin's Config down to its VOLATILE fields: the
+  // host drops every other field, and a schema with no volatile field yields no
+  // form at all — the entry is skipped by settings.describe(), its namespace never
+  // reaches the browser, and the page can only say the namespace is missing. That
+  // is exactly how this feature was dead on arrival, with nothing logged.
+  console.log('settings schema')
+  const schemaFields = Object.keys(Config.dict ?? {})
+  const volatileFields = schemaFields.filter((name) => Config.dict[name]?.meta?.volatile === true)
+  const MOUNT_ONLY = ['onboarding', 'stateDir']
+
+  await check('every config field is either live-editable or a documented mount-only one', () => {
+    const notVolatile = schemaFields.filter((name) => !volatileFields.includes(name))
+    assert.deepEqual(notVolatile.sort(), [...MOUNT_ONLY].sort())
+  })
+  await check('a schema with no volatile field is what breaks the page, so there must be many', () => {
+    assert.ok(volatileFields.length >= 20, `only ${volatileFields.length} volatile fields`)
+  })
+  await check('every field keeps its description, since that is the form label', () => {
+    const missing = schemaFields.filter((name) => !Config.dict[name]?.meta?.description)
+    assert.deepEqual(missing, [], `fields without a description: ${missing.join(', ')}`)
+  })
+  await check('the browser form covers exactly the fields the host will send', () => {
+    // A field in the form but not in the host's form shows an empty control whose
+    // value can never be read back; a field in the host's form but not in ours is
+    // simply unreachable from the UI.
+    // The entries are formatted across lines, so the separator must allow newlines.
+    const inForm = [...clientSource.matchAll(/\{\s*name:\s*'([A-Za-z]+)'/g)].map((m) => m[1])
+    const declared = inForm.filter((name) => schemaFields.includes(name))
+    assert.deepEqual([...new Set(declared)].sort(), [...volatileFields].sort())
+  })
+  await check('the plugin re-reads settings when the host applies them live', async () => {
+    // Volatile means the loader writes the value in place and announces it; a
+    // plugin that never listens keeps serving the old values while the UI shows
+    // the new ones.
+    const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
+    assert.match(indexSource, /ctx\.on\('loader\/volatile-update'/)
+    assert.match(indexSource, /resolveConfig\(ctx\.config \?\? config\)/)
   })
 
   console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)

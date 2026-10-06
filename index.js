@@ -89,7 +89,10 @@ export async function apply(ctx, config = {}) {
   // The default workspace for new conversations. `process.cwd()` is the harness
   // installation directory, so falling back to it silently would point the
   // agent at the running harness itself; resolve a real workspace instead.
-  const cwd = await resolveWorkspaceCwd(ctx, resolved.cwd, logger)
+  // The raw configured value is kept alongside the resolved one: a live change to
+  // `cwd` must be told apart from the resolved path we derived when it was empty.
+  let configuredCwd = resolved.cwd
+  const cwd = await resolveWorkspaceCwd(ctx, configuredCwd, logger)
   resolved = { ...resolved, cwd }
 
   // Credentials: entry config (patch/env) wins, then the stored app, then the
@@ -113,7 +116,7 @@ export async function apply(ctx, config = {}) {
 
   // Built once: the filer caches the workspace lookup and the sessions it has
   // already attached, so a per-call instance would redo both every message.
-  const fileSession = makeWorkspaceFiler(ctx, resolved.cwd, logger)
+  let fileSession = makeWorkspaceFiler(ctx, resolved.cwd, logger)
   const sessions = new ConversationSessions({
     sessionController: ctx.sessionController,
     cwd: resolved.cwd,
@@ -905,6 +908,61 @@ export async function apply(ctx, config = {}) {
       await transport.stop()
     })()
   })
+
+  /**
+   * Apply a live settings change.
+   *
+   * The Settings page edits VOLATILE fields only, and the loader applies those by
+   * writing the new value into the live schema in place and announcing it here —
+   * the plugin is not restarted. Everything this plugin reads per message already
+   * sees the new value; only the two things captured at mount need re-applying.
+   */
+  ctx.on('loader/volatile-update', (paths) => {
+    const previous = resolved
+    const next = resolveConfig(ctx.config ?? config)
+    // `next.cwd` is the CONFIGURED value; the resolved workspace is ours to keep.
+    resolved = { ...next, cwd: previous.cwd }
+    const changed = (paths ?? []).map((path) => (Array.isArray(path) ? path.join('.') : String(path)))
+    logger.info(`[feishu-card] settings changed live: ${changed.join(', ') || '(unspecified)'}`)
+
+    if (next.appId !== previous.appId
+      || next.appSecret !== previous.appSecret
+      || next.domain !== previous.domain) {
+      // The long connection was opened with the previous app, so it must be rebuilt.
+      void reconnect()
+      return
+    }
+    if (next.cwd !== configuredCwd) void remountWorkspace(next.cwd)
+  })
+
+  /** Re-point the workspace new conversations start in, after a live `cwd` change. */
+  async function remountWorkspace(rawCwd) {
+    try {
+      const workspace = await resolveWorkspaceCwd(ctx, rawCwd, logger)
+      configuredCwd = rawCwd
+      resolved = { ...resolved, cwd: workspace }
+      // Rebuilt rather than mutated: the filer caches the workspace it resolved.
+      fileSession = makeWorkspaceFiler(ctx, workspace, logger)
+      logger.info(`[feishu-card] new conversations now start in ${workspace}`)
+    } catch (error) {
+      logger.warn('[feishu-card] could not switch the workspace', error)
+    }
+  }
+
+  /** Rebuild the long connection after a live credential change. */
+  async function reconnect() {
+    try {
+      await transport.stop()
+      transport.updateCredentials({
+        appId: resolved.appId,
+        appSecret: resolved.appSecret,
+        domain: resolved.domain || undefined,
+      })
+      await startChannel()
+    } catch (error) {
+      logger.warn('[feishu-card] could not reconnect with the new credentials', error)
+    }
+  }
 
   if (hasCredentials(resolved)) {
     await startChannel()

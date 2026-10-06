@@ -116,7 +116,9 @@ export async function apply(ctx, config = {}) {
   })
   await sessions.load()
   // Group conversations that already exist, without waiting for their next message.
-  void sessions.adoptExisting().catch((error) => logger?.warn?.('[feishu-card] adopting existing sessions failed', error))
+  void sessions
+    .adoptExisting(lifetime.signal)
+    .catch((error) => logger?.warn?.('[feishu-card] adopting existing sessions failed', error))
 
   const transport = new FeishuTransport({ appId: resolved.appId, appSecret: resolved.appSecret, domain: resolved.domain || undefined, logger })
   const renderer = new TurnRenderer({

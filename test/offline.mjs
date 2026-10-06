@@ -1081,13 +1081,21 @@ async function main() {
     await assert.rejects(() => filer('s1'), /gone/)
   })
 
-  await check('startup adopts known rotations but skips vanished sessions', async () => {
+  await check('startup adopts rotations AND this workspace\'s persisted sessions', async () => {
     const tmp2 = await mkdtemp(join(tmpdir(), 'feishu-adopt-'))
     const controller = new FakeController()
     controller.inspect = async (id) => {
       if (!controller.live.has(id)) throw new Error('unknown session')
       return {}
     }
+    // What the Session LIST API would report.
+    controller.list = async () => ({
+      items: [
+        { sessionId: 'feishu-superseded', cwd: '/tmp' },   // in this cwd → adopt
+        { sessionId: 'feishu-elsewhere', cwd: '/other' },  // different cwd → leave
+        { sessionId: 'session-abc', cwd: '/tmp' },         // not ours → leave
+      ],
+    })
     const filed = []
     const s = new ConversationSessions({
       sessionController: controller,
@@ -1099,8 +1107,10 @@ async function main() {
     const here = await s.rotate('oc_here')   // persisted
     controller.live.add(here)
     await s.adoptExisting()
-    assert.deepEqual(filed, [here], 'only the session that still exists is filed')
-    assert.ok(!filed.includes(gone))
+    assert.deepEqual(filed.sort(), ['feishu-superseded', here].sort())
+    assert.ok(!filed.includes(gone), 'a vanished rotation is skipped')
+    assert.ok(!filed.includes('feishu-elsewhere'), 'another cwd is not claimed')
+    assert.ok(!filed.includes('session-abc'), 'a non-Feishu session is not claimed')
     await rm(tmp2, { recursive: true, force: true })
   })
 

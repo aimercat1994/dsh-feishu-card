@@ -38,6 +38,7 @@ lib/
   guard.js            工具守卫：按名称拒绝工具，纯判定 + 默认放行的容错
   media.js            入站媒体：类型嗅探、富文本解析、有界流收集
   images.js           图片流水线：逐张下载/校验/组装 prompt，失败只损失该张
+  outbound.js         出站文件：realpath 路径安全 + send_file 工具定义
   access.js           入站准入：谁可以开对话、为什么被丢弃（纯函数）
   log.js              控制台 + 落盘双写日志
 test/offline.mjs      102 项离线断言
@@ -211,6 +212,8 @@ goal 卡片按钮 → `onCardAction` → `applyGoalOperation()` → **真正调�
 **加一个卡片元素**：在 `ELEMENTS` 加 id（**只能用字母数字下划线、首字母、≤20**），在构造器里放进去，`invalidElementIds` 断言会自动校验。若需要流式写入，确保 `turn.js` 的 `#elementContent` 认识它。
 
 **加一个通知源**：在 `notice.js` 加一个纯格式化函数（可离线测试），在 `Notices` 加一个方法，在 `index.js` 接线。注意区分"回合内进面板"与"回合外发卡"。
+
+**加一个 agent 级工具**：在会话阶梯的 post-reach 钩子里用 `agent.ctx.effect(() => tools.register(...))` 注册，并**按 agent 实例**（WeakSet）去重——会话可能比 agent 活得久。`defineTool` 来自插件解析不到的包，所以直接传标准 JSON Schema；代价是参数校验得自己写。
 
 **加一个 `session/event` 处理**：在 `index.js` 的 switch 加 case。**先确认该事件真的存在**——见第 3 节的 module augmentation 陷阱。
 

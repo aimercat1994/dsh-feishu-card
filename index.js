@@ -23,6 +23,7 @@ import { Notices } from './lib/notice.js'
 import { ProgressCards } from './lib/progress.js'
 import { Fanout } from './lib/fanout.js'
 import { installToolGuard } from './lib/guard.js'
+import { buildSendFileTool, resolveSendablePath } from './lib/outbound.js'
 import { DROP, admit, isPolicyDrop } from './lib/access.js'
 import { failureNote, promptContent, resolveImages } from './lib/images.js'
 import { describeCall, describeDiff, formatTokens } from './lib/present.js'
@@ -174,6 +175,7 @@ export async function apply(ctx, config = {}) {
    */
   const pendingByChat = new Map()
   /** agentId -> disposer for that agent's own registrations. */
+  /** sessionId -> disposers for every per-agent registration this plugin made. */
   const agentRegistrations = new Map()
   let counter = 0
   const nextId = () => `${Date.now().toString(36)}${(counter++).toString(36)}`
@@ -601,8 +603,66 @@ export async function apply(ctx, config = {}) {
   const ensureToolGuard = (agent) => {
     if (!agent?.ctx || guarded.has(agent)) return
     guarded.add(agent)
-    const dispose = installToolGuard(agent, resolved.denyTools, logger)
-    if (dispose) agentRegistrations.set(agent.id, dispose)
+    const disposers = []
+    const guardDispose = installToolGuard(agent, resolved.denyTools, logger)
+    if (guardDispose) disposers.push(guardDispose)
+    const toolDispose = registerFileTool(agent)
+    if (toolDispose) disposers.push(toolDispose)
+    if (disposers.length > 0) agentRegistrations.set(agent.id, disposers)
+  }
+
+  /**
+   * Give this agent the ability to send a file back to its chat.
+   *
+   * Registered on the agent's own context, so it unwinds with the agent, and
+   * idempotent per agent instance for the same reason the guard is.
+   */
+  const registeredTools = new WeakSet()
+  const registerFileTool = (agent) => {
+    if (!agent?.ctx || registeredTools.has(agent) || !resolved.fileOutput) return undefined
+    registeredTools.add(agent)
+    const tools = agent.ctx.get('tools')
+    if (!tools || typeof tools.register !== 'function') {
+      logger.warn('[feishu-card] the tool registry is unavailable; send_file is NOT registered')
+      return undefined
+    }
+    return agent.ctx.effect(() => {
+      const dispose = tools.register(
+        buildSendFileTool({
+          resolve: (path) => resolveSendablePath(path, {
+            cwd: resolved.cwd,
+            allowedDirs: resolved.allowedFileDirs,
+            maxBytes: resolved.maxFileBytes,
+          }),
+          send: async ({ bytes, name, caption }) => {
+            const routing = sessions.routingFor(agent.id)
+            if (!routing?.chatId) throw new Error('这个会话没有可发送的目标聊天')
+            const fileKey = await transport.uploadFile(bytes, name)
+            const messageId = await transport.sendFile({
+              chatId: routing.chatId,
+              fileKey,
+              replyToMessageId: routing.replyToMessageId,
+            })
+            if (caption) {
+              await transport.sendText(caption, {
+                chatId: routing.chatId,
+                replyToMessageId: routing.replyToMessageId,
+              })
+            }
+            return { messageId }
+          },
+          logger,
+        }),
+      )
+      logger.info(`[feishu-card] send_file registered for ${agent.id} (workspace ${resolved.cwd})`)
+      return () => {
+        try {
+          dispose()
+        } catch {
+          // Already unwound with the agent.
+        }
+      }
+    })
   }
 
   ctx.on('agent/created', (payload) => {

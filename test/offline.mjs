@@ -13,7 +13,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -39,6 +39,7 @@ import { Fanout, agentEndLine, agentStartLine, runEndLine, runStartLine, subagen
 import { DENIAL_REASON, denialReason, installToolGuard } from '../lib/guard.js'
 import { DROP, admit, isPolicyDrop } from '../lib/access.js'
 import { collectStream, parsePostContent, sniffImageMediaType } from '../lib/media.js'
+import { SEND_FILE_TOOL, buildSendFileTool, isInside, resolveSendablePath } from '../lib/outbound.js'
 import { failureNote, promptContent, resolveImages } from '../lib/images.js'
 
 let failures = 0
@@ -1398,9 +1399,15 @@ async function main() {
     const sources = new Map()
     for (const file of files) sources.set(file, await readFile(new URL(file, root), 'utf8'))
 
-    // Prose mentions must not count as references.
+    // Prose and string contents must not count as references: `required: ['name']`
+    // names a field, it does not reference the `name` export.
     const strip = (src) =>
-      src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+      src
+        .replace(/\/\*[\s\S]*?\*\//g, ' ')
+        .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+        .replace(/'[^'\n]*'/g, "''")
+        .replace(/"[^"\n]*"/g, '""')
+        .replace(/`[^`]*`/g, '``')
 
     const exportedBy = new Map()
     for (const [file, raw] of sources) {
@@ -1450,6 +1457,101 @@ async function main() {
     }
     assert.deepEqual(problems, [], problems.join('; '))
   })
+
+  console.log('outbound path safety')
+  await check('isInside compares path SEGMENTS, not prefixes', () => {
+    // `/a/bc` must not count as inside `/a/b` — the classic prefix bug.
+    assert.equal(isInside('/a/b/c.txt', '/a/b'), true)
+    assert.equal(isInside('/a/b', '/a/b'), true)
+    assert.equal(isInside('/a/bc', '/a/b'), false)
+    assert.equal(isInside('/a/bc/d', '/a/b'), false)
+    assert.equal(isInside(undefined, '/a'), false)
+  })
+
+  const sandbox = await mkdtemp(join(tmpdir(), 'feishu-out-'))
+  const inside = join(sandbox, 'inside')
+  const outside = join(sandbox, 'outside')
+  await mkdir(inside)
+  await mkdir(outside)
+  await writeFile(join(inside, 'ok.txt'), 'hello')
+  await writeFile(join(outside, 'secret.txt'), 'secret')
+  await writeFile(join(inside, 'empty.txt'), '')
+  await writeFile(join(inside, 'big.bin'), Buffer.alloc(2048))
+  // The case the whole realpath step exists for: a symlink INSIDE the workspace
+  // pointing outside it. A prefix check on the unresolved path would allow it.
+  await symlink(join(outside, 'secret.txt'), join(inside, 'link.txt'))
+  await symlink(outside, join(inside, 'linkdir'))
+
+  await check('a workspace file is sendable', async () => {
+    const r = await resolveSendablePath('ok.txt', { cwd: inside })
+    assert.equal(r.ok, true)
+    assert.equal(r.name, 'ok.txt')
+    assert.equal(r.bytes, 5)
+  })
+  await check('a file outside the workspace is refused', async () => {
+    const r = await resolveSendablePath(join(outside, 'secret.txt'), { cwd: inside })
+    assert.equal(r.ok, false)
+    assert.match(r.reason, /不在允许发送的目录内/)
+  })
+  await check('a SYMLINK out of the workspace is refused', async () => {
+    // Without realpath this passes the prefix check and leaks the file.
+    const direct = await resolveSendablePath('link.txt', { cwd: inside })
+    assert.equal(direct.ok, false, 'a symlinked file must not escape')
+    const throughDir = await resolveSendablePath('linkdir/secret.txt', { cwd: inside })
+    assert.equal(throughDir.ok, false, 'a symlinked directory must not escape')
+  })
+  await check('allowedFileDirs widens the set deliberately', async () => {
+    const r = await resolveSendablePath(join(outside, 'secret.txt'), { cwd: inside, allowedDirs: [outside] })
+    assert.equal(r.ok, true)
+  })
+  await check('a missing path, a directory, an empty file and an oversized file are each refused', async () => {
+    assert.equal((await resolveSendablePath('nope.txt', { cwd: inside })).ok, false)
+    assert.equal((await resolveSendablePath('.', { cwd: inside })).ok, false)
+    assert.match((await resolveSendablePath('empty.txt', { cwd: inside })).reason, /空文件/)
+    const big = await resolveSendablePath('big.bin', { cwd: inside, maxBytes: 100 })
+    assert.equal(big.ok, false)
+    assert.match(big.reason, /上限/)
+  })
+  await check('an empty or non-string path is refused, not resolved to the cwd', async () => {
+    // resolve(cwd, '') is the cwd itself — silently sending a directory would be a
+    // nasty surprise.
+    assert.equal((await resolveSendablePath('', { cwd: inside })).ok, false)
+    assert.equal((await resolveSendablePath('   ', { cwd: inside })).ok, false)
+    assert.equal((await resolveSendablePath(undefined, { cwd: inside })).ok, false)
+  })
+
+  console.log('outbound tool')
+  await check('the tool declares a usable schema for the model', () => {
+    const tool = buildSendFileTool({ resolve: async () => ({ ok: false, reason: 'x' }), send: async () => ({}) })
+    assert.equal(tool.name, SEND_FILE_TOOL)
+    assert.equal(tool.parameters.type, 'object')
+    assert.deepEqual(tool.parameters.required, ['path'])
+    assert.equal(tool.parameters.additionalProperties, false)
+    assert.ok(tool.description.length > 40, 'the model needs to know when to use it')
+    assert.equal(typeof tool.execute, 'function')
+    assert.equal(typeof tool.output.render, 'function')
+  })
+  await check('a refusal is returned as a result, not thrown', async () => {
+    const tool = buildSendFileTool({ resolve: async () => ({ ok: false, reason: '不在允许目录' }), send: async () => ({}) })
+    const value = await tool.execute({ path: '/etc/passwd' })
+    assert.equal(value.sent, false)
+    assert.match(value.reason, /不在允许目录/)
+    assert.match(tool.output.render({}, value)[0].text, /未发送/)
+  })
+  await check('a success uploads and reports the file', async () => {
+    const sent = []
+    const tool = buildSendFileTool({
+      resolve: async () => ({ ok: true, path: join(inside, 'ok.txt'), name: 'ok.txt', bytes: 5 }),
+      send: async (f) => { sent.push(f); return { messageId: 'om_1' } },
+    })
+    const value = await tool.execute({ path: 'ok.txt', caption: '给你' })
+    assert.deepEqual(value, { sent: true, name: 'ok.txt', bytes: 5 })
+    assert.equal(sent.length, 1)
+    assert.equal(sent[0].name, 'ok.txt')
+    assert.equal(sent[0].caption, '给你')
+    assert.match(tool.output.render({}, value)[0].text, /已发送文件 ok.txt/)
+  })
+  await rm(sandbox, { recursive: true, force: true })
 
   console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)
   process.exit(failures === 0 ? 0 : 1)

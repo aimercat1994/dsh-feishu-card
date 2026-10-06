@@ -52,6 +52,15 @@
 - 发送前用 `attachments.validateImage` 预校验，避免策略拒绝把整条 prompt（含文字）一起打回
 - 暂不支持的入站类型（文件/音频/表情包）会**回一句话**，而不是让消息无声消失
 
+**出站文件**（`fileOutput`，默认开启；`send_file` 工具）
+
+- agent 可以用 `send_file` 把**工作区里已有的文件**作为附件发到当前会话，用于交付产物
+- **工作区始终可发**——这不增加任何文件访问权限（agent 本来就能读那里），只是让它能把读到的东西交出来
+- 其他目录需显式配 `allowedFileDirs`（默认空）
+- 路径检查是**先 realpath 再比较**：工作区里一个指向外部的符号链接会被拒绝。只比对未解析路径的前缀是这个功能最典型的漏洞
+- 逐条拒绝并说明原因：不存在、不是普通文件、空文件、超过上限、不在允许目录内
+- 上限 `maxFileBytes` 默认 30 MB（平台硬限制，超过它平台也会拒）
+
 **运维**
 
 - 拒绝入站消息时写日志（`senderAllowlist` / `groupAllowlist` 命中会记录 chat 与 sender），
@@ -162,6 +171,9 @@ FEISHU_DOMAIN=              # 国际版 Lark 填 https://open.larksuite.com
     pressureWarnTokens: 120000           # 上下文用量告警阈值
     reactionFeedback: true               # 在用户消息上打状态表情
     images: true                         # 图片随 prompt 送入（见下）
+    fileOutput: true                     # 允许 agent 用 send_file 交付产物
+    allowedFileDirs: []                  # 除工作区外还允许发送的目录
+    maxFileBytes: 31457280               # 30 MB，平台硬限制
 
     # 生命周期
     autoResumeGoals: false               # 每条消息前尝试重新武装被 disarm 的 goal
@@ -206,7 +218,7 @@ node test/offline.mjs
 | 限制 | 说明 |
 | --- | --- |
 | 入站只支持文字与图片 | 文件/音频/表情包会回一句"暂不支持"，不会处理 |
-| 出站文件（`send_file`）未实现 | agent 还不能把产物发到聊天里 |
+| 出站文件尚未真实跑通 | 路径安全与工具契约已离线覆盖（含符号链接逃逸），但**还没在飞书里真发过一个文件** |
 | 无 CoT 输出模式 | HFC 的 `output: cot`（飞书原生思考消息）是另一条渲染路径，未实现 |
 | `denyTools` 的运行时效果未验证 | 逻辑已抽出并离线覆盖，注册点覆盖两条会话路径，但默认名单为空（与 GUI 同权限），因此**该路径从未被真实触发过**。要依赖它之前请先按 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) 的验证清单实测一次 |
 | 多问题逐张追问 | 一次多问按顺序发多张卡片，未合并为一张表单 |
@@ -215,10 +227,9 @@ node test/offline.mjs
 
 ## 路线图
 
-1. **图片输入 / 文件输出** — 消息里的图 → `attachments.saveImage` → prompt 的 `image` part（默认关闭：不支持的模型路由会让该会话历史永久污染）；`send_file` 注册到 agent ctx + `allowedFileDirs` 白名单
-2. **`denyTools` 实测** + 授权收窄完整验证
-3. **`output: cot` 模式** — 需要飞书客户端版本门槛
-4. **多问题合并表单**
+1. **`denyTools` 守卫与 `approvers` 的运行时实测** — 两处都需要一个能真实触发它们的场景
+2. **`output: cot` 模式**（飞书原生思考消息）— 需要客户端版本门槛
+3. **多问题合并表单**
 
 ## 许可证与致谢
 

@@ -285,7 +285,7 @@ export async function apply(ctx, config = {}) {
           )
           return
         }
-      } else if (name === 'status') {        } else if (name === 'status') {
+      } else if (name === 'status') {
         reply = {
           text: `\`${sessionId}\`\n卡片：${renderer.has(sessionId) ? t.statusBusy : t.statusIdle}`,
         }

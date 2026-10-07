@@ -2515,6 +2515,28 @@ async function main() {
     assertValidCard(card, 'empty help card')
     assert.match(JSON.stringify(card), /没有可用的命令/)
   })
+  await check('every command branch is reachable, non-empty and tested once', async () => {
+    // A duplicated `} else if (name === 'status') {` line made the first branch an
+    // EMPTY block, so `/status` answered nothing while its real body sat in a branch
+    // that could never run — the same condition had already been tested. Nothing
+    // threw, nothing was logged, and the command simply did nothing.
+    const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
+    const start = indexSource.indexOf('const runCommand = async')
+    const end = indexSource.indexOf('async function onMessage')
+    const body = indexSource.slice(start, end)
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+    const names = [...body.matchAll(/name === '([a-z]+)'/g)].map((m) => m[1])
+    assert.ok(names.length >= 7, `expected the command chain, found ${names.length} branches`)
+    assert.equal(new Set(names).size, names.length, `a command is tested twice: ${names.join(', ')}`)
+    assert.doesNotMatch(body, /\{\s*\}\s*else\b/, 'no branch may be an empty block')
+    // Every command the card can offer needs a branch. `/stop` is the exception: it
+    // is answered before the chain so it works mid-turn, and it is not a button.
+    for (const entry of ownCommands('zh')) {
+      if (entry.name === 'stop') continue
+      assert.ok(names.includes(entry.name), `/${entry.name} has no branch`)
+    }
+  })
   await check('runCommand has no reference to the caller it was extracted from', async () => {
     // The extraction replaced `inbound.chatId`/`inbound.messageId` but missed a bare
     // `inbound`, which threw at runtime — the click did nothing and the log named no

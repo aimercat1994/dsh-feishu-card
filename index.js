@@ -688,10 +688,13 @@ export async function apply(ctx, config = {}) {
   /**
    * Reconcile Feishu's slash-command picker with what this bot actually answers.
    *
-   * Deferred to the first admitted message because the host's registry is queried
-   * PER AGENT (`commands.list(agent)`), and there is no agent before someone
-   * talks to the bot. Once per process is enough: the set only changes when the
-   * deployment does.
+   * Runs as soon as the plugin has a session to ask about — which includes
+   * startup, because adopting an existing session reaches the same hook without an
+   * agent yet, and the host's registry answers the global layer for that. Once per
+   * process is enough: the set only changes when the deployment does.
+   *
+   * A failure resets the latch so the next session retries, rather than leaving the
+   * panel wrong for the lifetime of the process.
    *
    * This is what stops the picker from lying. The commands it listed before came
    * from a plugin that had since been uninstalled, so half of them answered

@@ -40,6 +40,15 @@ import {
   resolveModelQuery,
 } from './lib/model.js'
 import {
+  buildChoiceCard,
+  choiceOptionValue,
+  permissionOptions,
+  presetLocked,
+  presetOptions,
+  presetStrings,
+  resolveOptionQuery,
+} from './lib/presets-ui.js'
+import {
   buildSessionsCard,
   resolveSessionQuery,
   selectableSessions,
@@ -282,6 +291,87 @@ export async function apply(ctx, config = {}) {
           reply = {
             text: `\`${sessionId}\`\n卡片：${renderer.has(sessionId) ? t.statusBusy : t.statusIdle}`,
           }
+        } else if (name === 'preset') {
+          const t = presetStrings(resolved.locale)
+          const registry = ctx.get('agentPresets')
+          if (!registry || typeof registry.list !== 'function') {
+            reply = { error: true, text: t.noService }
+          } else if (agentPresetLocked(agent)) {
+            // A picker whose every choice would be refused is worse than the
+            // constraint itself, so this is an explanation, not a card.
+            reply = { error: true, text: t.locked }
+          } else {
+            const query = text.replace(/^\/preset\b/, '').trim()
+            const all = await registry.list()
+            const options = presetOptions(all)
+            const outcome = resolveOptionQuery(query, options, resolved.locale)
+            if (outcome.list) {
+              if (options.length === 0) {
+                reply = { error: true, text: t.noPresets }
+              } else {
+                const currentId = currentPreset(agent)
+                await transport.sendCardOnce(
+                  buildChoiceCard({
+                    title: t.presetTitle,
+                    heading: t.presetHeading,
+                    currentLabel: options.find((o) => o.value === currentId)?.name ?? currentId ?? t.unknownPreset,
+                    currentValue: currentId,
+                    placeholder: t.presetPlaceholder,
+                    options,
+                    behavior: { k: 'preset', s: sessionId },
+                    hint: t.presetHint,
+                    emptyText: t.noPresets,
+                    locale: resolved.locale,
+                  }),
+                  { chatId: inbound.chatId, replyToMessageId: inbound.messageId },
+                )
+                return
+              }
+            } else if (outcome.error) {
+              reply = { error: true, text: `${outcome.error}\n\n${t.usage}` }
+            } else {
+              await registry.select(agent, outcome.option.value)
+              reply = { text: t.toast(outcome.option.name) }
+            }
+          }
+        } else if (name === 'permission') {
+          const t = presetStrings(resolved.locale)
+          const service = ctx.get('permissionPresets')
+          if (!service || typeof service.catalog !== 'function') {
+            reply = { error: true, text: t.noService }
+          } else {
+            const query = text.replace(/^\/permission\b/, '').trim()
+            const options = permissionOptions(service.catalog())
+            const outcome = resolveOptionQuery(query, options, resolved.locale)
+            if (outcome.list) {
+              if (options.length === 0) {
+                reply = { error: true, text: t.noPermission }
+              } else {
+                const currentName = service.current(agent.session)
+                await transport.sendCardOnce(
+                  buildChoiceCard({
+                    title: t.permissionTitle,
+                    heading: t.permissionHeading,
+                    currentLabel: options.find((o) => o.value === currentName)?.name ?? (currentName || t.unknownPermission),
+                    currentValue: currentName,
+                    placeholder: t.permissionPlaceholder,
+                    options,
+                    behavior: { k: 'permission', s: sessionId },
+                    hint: t.permissionHint,
+                    emptyText: t.noPermission,
+                    locale: resolved.locale,
+                  }),
+                  { chatId: inbound.chatId, replyToMessageId: inbound.messageId },
+                )
+                return
+              }
+            } else if (outcome.error) {
+              reply = { error: true, text: `${outcome.error}\n\n${t.usage}` }
+            } else {
+              service.set(agent.session, outcome.option.value)
+              reply = { text: t.toast(outcome.option.name) }
+            }
+          }
         } else if (name === 'sessions') {
           const t = sessionStrings(resolved.locale)
           const rows = await listSessions()
@@ -484,6 +574,67 @@ export async function apply(ctx, config = {}) {
       typeof name === 'string' && name.startsWith(CUSTOM_SUBMIT_PREFIX)
         ? name.slice(CUSTOM_SUBMIT_PREFIX.length)
         : undefined
+    // The two session-scoped choices share one branch: the behavior names the
+    // conversation and the kind, the option names the value.
+    if (action.k === 'preset' || action.k === 'permission') {
+      const t = presetStrings(resolved.locale)
+      const operatorId = operator?.openId ?? operator
+      if (resolved.approvers.length > 0 && (!operatorId || !resolved.approvers.includes(operatorId))) {
+        logger?.warn?.(`[feishu-card] refused a ${action.k} click from a non-approver (${operatorId})`)
+        return { toast: { type: 'warning', content: '无权操作' } }
+      }
+      if (typeof action.s !== 'string' || !sessions.serves(action.s)) {
+        return { toast: { type: 'info', content: t.gone } }
+      }
+      const value = parseChoice(option, action)?.v
+      if (typeof value !== 'string' || value.length === 0) {
+        return { toast: { type: 'info', content: t.gone } }
+      }
+      const agent = await agentFor(action.s)
+      if (!agent) return { toast: { type: 'warning', content: t.noService } }
+      try {
+        if (action.k === 'preset') {
+          const registry = ctx.get('agentPresets')
+          if (!registry || typeof registry.select !== 'function') {
+            return { toast: { type: 'warning', content: t.noService } }
+          }
+          // Re-checked here, not just when the card was built: the session may have
+          // started a turn since, and the host would refuse with a raw error.
+          if (agentPresetLocked(agent)) return { toast: { type: 'warning', content: t.locked } }
+          await registry.select(agent, value)
+        } else {
+          const service = ctx.get('permissionPresets')
+          if (!service || typeof service.set !== 'function') {
+            return { toast: { type: 'warning', content: t.noService } }
+          }
+          service.set(agent.session, value)
+        }
+        const label = await choiceLabel(action.k, value, resolved.locale)
+        logger.info(`[feishu-card] ${action.k} switched to ${value} for ${action.s}`)
+        const card = buildChoiceCard({
+          title: action.k === 'preset' ? t.presetTitle : t.permissionTitle,
+          heading: action.k === 'preset' ? t.presetHeading : t.permissionHeading,
+          currentLabel: label,
+          currentValue: value,
+          placeholder: action.k === 'preset' ? t.presetPlaceholder : t.permissionPlaceholder,
+          options: [],
+          behavior: {},
+          settledText: action.k === 'preset' ? t.settledPreset(label) : t.settledPermission(label),
+          emptyText: '',
+          settled: true,
+        })
+        return { toast: { type: 'success', content: t.toast(label) }, card: { type: 'raw', data: card } }
+      } catch (error) {
+        // The lock is the one refusal a user can act on, so it is reported in full
+        // rather than as a generic failure.
+        if (error?.code === 'agent-preset/locked' || /already started/.test(String(error?.message ?? ''))) {
+          return { toast: { type: 'warning', content: t.locked } }
+        }
+        logger.warn(`[feishu-card] could not switch the ${action.k}`, error)
+        return { toast: { type: 'error', content: t.toastFailed } }
+      }
+    }
+
     // An effort select carries its model in the behavior and its choice in the
     // option, so the two halves of the decision arrive together.
     if (action.k === 'effort') {
@@ -1044,6 +1195,63 @@ export async function apply(ctx, config = {}) {
       // Worth a line: a platform that reports the choice some other way would
       // otherwise look exactly like a click that did nothing.
       logger.warn(`[feishu-card] unreadable select option: ${raw.slice(0, 120)}`)
+      return undefined
+    }
+  }
+
+  /**
+   * The agent for a session id, for the card actions that carry no agent.
+   *
+   * Cheap for a bound conversation: the session is already live, so this is a
+   * lookup rather than a resume.
+   */
+  const agentFor = async (sessionId) => {
+    const controller = ctx.get('sessionController')
+    if (!controller || typeof controller.resolveAgent !== 'function') return undefined
+    try {
+      const result = await controller.resolveAgent(sessionId)
+      return result?.agent
+    } catch (error) {
+      logger.warn('[feishu-card] could not resolve the session agent', error)
+      return undefined
+    }
+  }
+
+  /** A choice's display name, for the confirmation text. */
+  const choiceLabel = async (kind, value, locale) => {
+    const t = presetStrings(locale)
+    try {
+      if (kind === 'preset') {
+        const registry = ctx.get('agentPresets')
+        const found = presetOptions(await registry?.list?.() ?? []).find((option) => option.value === value)
+        return found?.name ?? value
+      }
+      const service = ctx.get('permissionPresets')
+      return permissionOptions(service?.catalog?.()).find((option) => option.value === value)?.name ?? value
+    } catch {
+      return value || t.unknownPreset
+    }
+  }
+
+  /** Whether this session has already run a turn, which locks its agent preset. */
+  const agentPresetLocked = (agent) => {
+    const projections = ctx.get('sessionProjections')
+    if (!projections || !agent?.session) return false
+    try {
+      return presetLocked(projections.stateOf(agent.session, 'turnBoundary'))
+    } catch (error) {
+      logger.warn('[feishu-card] could not read the turn boundary', error)
+      return false
+    }
+  }
+
+  /** The session's current agent preset id, or undefined. */
+  const currentPreset = (agent) => {
+    const projections = ctx.get('sessionProjections')
+    if (!projections || !agent?.session) return undefined
+    try {
+      return projections.stateOf(agent.session, 'agentPreset') ?? undefined
+    } catch {
       return undefined
     }
   }

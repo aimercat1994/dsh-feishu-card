@@ -607,6 +607,35 @@ catalog 里本来就有 `reasoning: {efforts:[{id,name,description?}], defaultEf
 
 断言 220。
 
+
+### `/preset` 与 `/permission`：模式与权限选择
+
+两者形状相同（会话级、从固定集合里选一个），所以共用一个卡片构造、一个 select 元素、一套载荷约定（意图放在 option value 的 `{v}` 里，behavior 只做常量标记）。
+
+**但它们有一处不能忽略的差别：**
+
+```js
+// dsh-agent-preset-registry
+if (boundary.openTurnStartSeq !== null || boundary.lastTurn > 0)
+  throw new RemoteError('agent-preset/locked', 'This session has already started')
+```
+
+**模式只能在会话开始前选**——跑过回合之后宿主会拒绝。权限则随时可改。
+
+所以 `/preset` 在已开始的会话上**不给选择卡**，而是给一句解释加出路（"先 `/new` 再 `/preset`"）：**一个每个选项都会被拒绝的选择器，比直接说清约束更糟**。卡片动作里也再查一次锁定状态——画卡到点击之间会话可能已经开始了。
+
+**其它取舍：**
+
+- **`presetLocked()` 精确复刻宿主那行判断**，不做近似：它的存在就是为了**预测**一次拒绝，两个方向错都是 bug（假阳性藏掉可用入口，假阴性给一个必然失败的入口）。
+- **隐藏 `broken` 预设**：`broken` 意味着它 compose 失败，选了也起不来——列出来是个死胡同。
+- **权限选项过滤掉空 value**：动作里会拒绝空值，列出来同样是死胡同。
+- **按 value 或 name 解析，重名时拒绝**：把错误的模式应用到会话上，用户是看不出来的。
+- **`/permission` 严格超集于宿主命令**：宿主的 `/permission` 是文本命令（无参数回一句 `current preset X (available: ...)`），飞书里我给下拉选择，同时保留 `/permission <name>` 参数形式。
+
+**顺带修掉一个自己引入的 bug**：`buildChoiceCard` 原先只有一个 `currentLine` 参数，我传了对象进去——而它会被拼进 markdown，**收敛卡会显示 `[object Object]`**。拆成 `currentLabel`（给人看的文案）与 `currentValue`（必须精确匹配某个选项，否则预选静默失效）。断言里加了 `doesNotMatch(/object Object/)`。
+
+断言 220 → 229。
+
 ---
 
 ## 未完成

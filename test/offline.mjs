@@ -31,6 +31,14 @@ import {
 import { TurnRenderer } from '../lib/turn.js'
 import { ConversationSessions, conversationKey, makeWorkspaceFiler, sessionIdFor } from '../lib/session.js'
 import {
+  buildChoiceCard,
+  choiceOptionValue,
+  permissionOptions,
+  presetLocked,
+  presetOptions,
+  resolveOptionQuery,
+} from '../lib/presets-ui.js'
+import {
   SESSION_LIMIT,
   buildSessionsCard,
   relativeTime,
@@ -1796,7 +1804,7 @@ async function main() {
       { name: 'has-dash', description: 'nope' },
       { name: '  ', description: 'nope' },
     ] })
-    assert.deepEqual(entries.map((e) => e.command), ['help', 'model', 'new', 'sessions', 'status', 'stop', 'switch'])
+    assert.deepEqual(entries.map((e) => e.command), ['help', 'model', 'new', 'permission', 'preset', 'sessions', 'status', 'stop', 'switch'])
   })
   await check("this channel's own commands win a name collision", () => {
     // The plugin intercepts these before the host registry, so ours is what runs.
@@ -2295,6 +2303,120 @@ async function main() {
     assert.ok(action > 0 && lookup > 0 && action < lookup, 'the stateless branch must come first')
     // And it must verify the conversation is one this channel serves.
     assert.match(indexSource.slice(action, action + 900), /sessions\.keyOf\(action\.s\)/)
+  })
+
+  // Both are one value out of a small fixed set, applied to the session this
+  // conversation is on.
+  console.log('preset and permission pickers')
+  await check('the preset lock mirrors the host guard exactly', () => {
+    // This check exists to PREDICT a refusal, so being wrong either way is a bug:
+    // a false positive hides a usable picker, a false negative offers one that fails.
+    assert.equal(presetLocked({ openTurnStartSeq: null, lastTurn: 0 }), false)
+    assert.equal(presetLocked({ openTurnStartSeq: 5, lastTurn: 0 }), true, 'an open turn locks it')
+    assert.equal(presetLocked({ openTurnStartSeq: null, lastTurn: 3 }), true, 'a finished turn locks it')
+    assert.equal(presetLocked(undefined), false, 'no projection is not evidence of a lock')
+    assert.equal(presetLocked(null), false)
+  })
+  await check('broken presets are hidden and order is respected', () => {
+    // A preset that failed to compose cannot be selected; offering it is a dead end.
+    const options = presetOptions([
+      { id: 'b', name: 'B', order: 2 },
+      { id: 'broken', name: 'Broken', order: 1, broken: 'compose failed' },
+      { id: 'a', name: 'A', order: 1 },
+    ])
+    assert.deepEqual(options.map((o) => o.value), ['a', 'b'])
+    assert.deepEqual(presetOptions(undefined), [])
+  })
+  await check('permission options come from the catalog', () => {
+    const options = permissionOptions({ options: [{ value: 'ask', name: 'Ask' }, { value: '', name: 'bad' }], defaultPreset: 'ask' })
+    assert.deepEqual(options.map((o) => o.value), ['ask'])
+    assert.deepEqual(permissionOptions(undefined), [])
+  })
+  await check('a typed value or name resolves, an ambiguous one is refused', () => {
+    const options = [{ value: 'standard', name: '标准' }, { value: 'minimal', name: '极简' }]
+    assert.equal(resolveOptionQuery('standard', options, 'zh').option.value, 'standard')
+    assert.equal(resolveOptionQuery('标准', options, 'zh').option.value, 'standard')
+    assert.equal(resolveOptionQuery('STANDARD', options, 'zh').option.value, 'standard')
+    assert.match(resolveOptionQuery('nope', options, 'zh').error, /找不到/)
+    assert.equal(resolveOptionQuery('', options, 'zh').list, true)
+    // Applying the wrong preset to a session is not something the user can see
+    // happened, so a shared name must not be guessed.
+    const clash = [{ value: 'a', name: '同名' }, { value: 'b', name: '同名' }]
+    assert.match(resolveOptionQuery('同名', clash, 'zh').error, /匹配到多个/)
+  })
+  await check('the choice card preselects the current value and carries the kind', () => {
+    const card = buildChoiceCard({
+      title: 'DSH · 模式',
+      heading: '**当前模式**',
+      currentLabel: '标准',
+      currentValue: 'standard',
+      placeholder: '选择模式',
+      options: [{ value: 'standard', name: '标准' }, { value: 'minimal', name: '极简' }],
+      behavior: { k: 'preset', s: 'feishu-abc' },
+      hint: 'hint',
+      emptyText: 'none',
+    })
+    assertValidCard(card, 'preset card')
+    assert.deepEqual(invalidElementIds(card), [])
+    assert.deepEqual(duplicateElementIds(card), [])
+    const select = card.body.elements.find((el) => el.tag === 'select_static')
+    assert.equal(select.initial_option, choiceOptionValue('standard'))
+    assert.deepEqual(select.behaviors, [{ type: 'callback', value: { k: 'preset', s: 'feishu-abc' } }])
+    assert.deepEqual(select.options.map((o) => JSON.parse(o.value).v), ['standard', 'minimal'])
+    // The label is prose for the reader; the value must match an option exactly.
+    assert.match(JSON.stringify(card.body.elements[0]), /标准/)
+  })
+  await check('a settled choice card shows the outcome, never an object', () => {
+    // The label and the value are separate parameters because the label is
+    // concatenated into markdown — passing the record would render "[object Object]".
+    const card = buildChoiceCard({
+      title: 'DSH · 权限',
+      heading: '**当前权限**',
+      currentLabel: '极简',
+      currentValue: 'minimal',
+      placeholder: 'x',
+      options: [],
+      behavior: {},
+      settledText: '已切到 **极简**。',
+      emptyText: '',
+      settled: true,
+    })
+    assertValidCard(card, 'settled choice card')
+    const text = JSON.stringify(card)
+    assert.match(text, /极简/)
+    assert.doesNotMatch(text, /object Object/)
+    assert.equal((text.match(/"tag":"select_static"/g) ?? []).length, 0, 'no picker once settled')
+  })
+  await check('an empty catalog still renders a valid card', () => {
+    const card = buildChoiceCard({
+      title: 'T', heading: 'H', currentLabel: 'none', currentValue: undefined,
+      placeholder: 'p', options: [], behavior: {}, emptyText: '（没有可选）',
+    })
+    assertValidCard(card, 'empty choice card')
+    assert.match(JSON.stringify(card), /没有可选/)
+  })
+  await check('/preset explains the lock instead of offering a picker', async () => {
+    // Every choice would be refused, so the constraint itself is the answer.
+    const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
+    const branch = indexSource.slice(indexSource.indexOf("name === 'preset'"))
+    assert.match(branch.slice(0, 500), /agentPresetLocked\(agent\)/)
+    assert.match(branch.slice(0, 500), /text: t\.locked/)
+    // And the action re-checks it, since the session may have started since the
+    // card was drawn.
+    const action = indexSource.slice(indexSource.indexOf("action.k === 'preset' || action.k === 'permission'"))
+    const end = action.indexOf("action.k === 'effort'")
+    const body = end > 0 ? action.slice(0, end) : action.slice(0, 4000)
+    assert.match(body, /agentPresetLocked\(agent\)/)
+    assert.match(body, /agent-preset\/locked/)
+  })
+  await check('/preset and /permission are advertised by the channel', () => {
+    assert.ok(OWN_PANEL_COMMANDS.some((c) => c.command === 'preset'))
+    assert.ok(OWN_PANEL_COMMANDS.some((c) => c.command === 'permission'))
+    for (const locale of ['zh', 'en']) {
+      const lines = strings(locale).pluginCommands
+      assert.ok(lines.some((line) => line.includes('/preset')), `${locale} help must list /preset`)
+      assert.ok(lines.some((line) => line.includes('/permission')), `${locale} help must list /permission`)
+    }
   })
 
   console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)

@@ -31,7 +31,14 @@ import { Fanout } from './lib/fanout.js'
 import { installToolGuard } from './lib/guard.js'
 import { buildSendFileTool, resolveSendablePath } from './lib/outbound.js'
 import { DROP, admit, isPolicyDrop } from './lib/access.js'
-import { buildModelCard, describeSelection, modelStrings, resolveModelQuery } from './lib/model.js'
+import {
+  buildEffortCard,
+  buildModelCard,
+  describeSelection,
+  effortsFor,
+  modelStrings,
+  resolveModelQuery,
+} from './lib/model.js'
 import {
   buildSessionsCard,
   resolveSessionQuery,
@@ -331,12 +338,16 @@ export async function apply(ctx, config = {}) {
             if (outcome.error) {
               reply = { error: true, text: `${outcome.error}\n\n${t.usage}` }
             } else {
-              const value = await ctx.get('sessionController').selectModel({
+              const requested = {
                 sessionId,
                 provider: outcome.entry.provider,
                 model: outcome.entry.model,
-              })
-              reply = { text: t.switched(describeSelection(value?.selected ?? outcome.entry)) }
+              }
+              // Absent means "leave the effort alone"; the host keeps whatever the
+              // session already had, so only send it when one was asked for.
+              if (outcome.effort !== undefined) requested.reasoningEffort = outcome.effort
+              const value = await ctx.get('sessionController').selectModel(requested)
+              reply = { text: t.switched(describeSelection(value?.selected ?? requested)) }
             }
           }
         } else if (name === 'help') {
@@ -531,8 +542,29 @@ export async function apply(ctx, config = {}) {
         return { toast: { type: 'warning', content: t.noController } }
       }
       try {
-        const value = await controller.selectModel({ sessionId: action.s, provider: action.p, model: action.m })
-        const selected = value?.selected ?? { provider: action.p, model: action.m }
+        const requested = { sessionId: action.s, provider: action.p, model: action.m }
+        // `e` is what separates "apply this effort" from "still choosing": without
+        // it, a model that offers efforts opens the effort picker instead of being
+        // applied with a default the user never saw.
+        if (typeof action.e !== 'string') {
+          const catalog = await readModelCatalog()
+          const { efforts } = catalog ? effortsFor(catalog, action.p, action.m) : { efforts: [] }
+          if (efforts.length > 0) {
+            const card = buildEffortCard({
+              catalog,
+              current: await currentSelectionFor(action.s),
+              provider: action.p,
+              model: action.m,
+              sessionId: action.s,
+              locale: resolved.locale,
+            })
+            return { card: { type: 'raw', data: card } }
+          }
+        } else if (action.e !== '') {
+          requested.reasoningEffort = action.e
+        }
+        const value = await controller.selectModel(requested)
+        const selected = value?.selected ?? requested
         const label = describeSelection(selected)
         logger.info(`[feishu-card] model switched to ${label} for ${action.s}`)
         // Rewrite the picker so it shows the new state: a toast alone leaves the
@@ -973,6 +1005,25 @@ export async function apply(ctx, config = {}) {
     sessions.bind(key, routing)
     logger.info(`[feishu-card] conversation moved from ${previous} to ${target}`)
     return { previous }
+  }
+
+  /**
+   * The current model selection of a session, resolved from its id.
+   *
+   * The card action carries a session id, not an agent, and the picker needs the
+   * live selection to mark the active effort. `resolveAgent` is cheap here: the
+   * conversation is bound, so the session is already live.
+   */
+  const currentSelectionFor = async (sessionId) => {
+    const controller = ctx.get('sessionController')
+    if (!controller || typeof controller.resolveAgent !== 'function') return undefined
+    try {
+      const result = await controller.resolveAgent(sessionId)
+      return result?.agent ? currentModelSelection(result.agent) : undefined
+    } catch (error) {
+      logger.warn('[feishu-card] could not resolve the session for its model selection', error)
+      return undefined
+    }
   }
 
   /** The host's model catalogue, or `undefined` when this deployment has none. */

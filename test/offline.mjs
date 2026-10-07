@@ -40,8 +40,10 @@ import {
 } from '../lib/sessions-ui.js'
 import { commandName, helpText, isCommandLine, runCommandLine, strings } from '../lib/commands.js'
 import {
+  buildEffortCard,
   buildModelCard,
   describeSelection,
+  effortsFor,
   flattenCatalog,
   resolveModelQuery,
 } from '../lib/model.js'
@@ -1874,6 +1876,110 @@ async function main() {
     failures: [],
   }
 
+  await check('reasoning efforts are read from the catalogue, or reported absent', () => {
+    const withEfforts = {
+      default: { provider: 'deepseek', model: 'pro' },
+      groups: [{ id: 'deepseek', name: 'DeepSeek', models: [
+        { id: 'pro', name: 'Pro', reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }], defaultEffort: 'low' } },
+        { id: 'flash', name: 'Flash' },
+      ] }],
+      failures: [],
+    }
+    assert.deepEqual(effortsFor(withEfforts, 'deepseek', 'pro').efforts.map((e) => e.id), ['low', 'high'])
+    assert.equal(effortsFor(withEfforts, 'deepseek', 'pro').defaultEffort, 'low')
+    // A model with no reasoning block has no such choice; that is not an error.
+    assert.deepEqual(effortsFor(withEfforts, 'deepseek', 'flash').efforts, [])
+    assert.deepEqual(effortsFor(withEfforts, 'nope', 'nope').efforts, [])
+  })
+  await check('an effort can be given on the command line', () => {
+    const cat = {
+      default: { provider: 'deepseek', model: 'pro' },
+      groups: [{ id: 'deepseek', name: 'DeepSeek', models: [
+        { id: 'pro', name: 'Pro', reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }] } },
+        { id: 'flash', name: 'Flash' },
+      ] }],
+      failures: [],
+    }
+    assert.equal(resolveModelQuery('deepseek/pro high', cat, 'zh').effort, 'high')
+    assert.equal(resolveModelQuery('deepseek/pro High', cat, 'zh').effort, 'high', 'names work too')
+    assert.equal(resolveModelQuery('pro low', cat, 'zh').effort, 'low')
+    assert.equal(resolveModelQuery('deepseek/pro', cat, 'zh').effort, undefined)
+    // An effort the model does not offer must be refused, not silently dropped:
+    // dropping it would look like it took effect.
+    assert.match(resolveModelQuery('deepseek/pro ultra', cat, 'zh').error, /找不到推理档位/)
+    assert.match(resolveModelQuery('deepseek/flash high', cat, 'zh').error, /不支持推理档位/)
+  })
+  await check('the effort picker marks the active effort and offers the default', () => {
+    const cat = {
+      default: { provider: 'deepseek', model: 'pro' },
+      groups: [{ id: 'deepseek', name: 'DeepSeek', models: [
+        { id: 'pro', name: 'Pro', reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }], defaultEffort: 'low' } },
+      ] }],
+      failures: [],
+    }
+    const card = buildEffortCard({
+      catalog: cat,
+      current: { provider: 'deepseek', model: 'pro', reasoningEffort: 'high' },
+      provider: 'deepseek',
+      model: 'pro',
+      sessionId: 'feishu-abc',
+      locale: 'zh',
+    })
+    assertValidCard(card, 'effort card')
+    assert.deepEqual(invalidElementIds(card), [])
+    assert.deepEqual(duplicateElementIds(card), [])
+    const buttons = []
+    const walk = (node) => {
+      if (Array.isArray(node)) return node.forEach(walk)
+      if (!node || typeof node !== 'object') return
+      if (node.tag === 'button') buttons.push(node)
+      Object.values(node).forEach(walk)
+    }
+    walk(card)
+    // One per effort, plus an explicit "default" — which is a distinct outcome from
+    // "no effort recorded", so it cannot be folded into the effort list.
+    assert.equal(buttons.length, 3)
+    const payloads = buttons.map((b) => b.behaviors[0].value)
+    assert.deepEqual(payloads.map((p) => p.e), ['low', 'high', ''])
+    for (const payload of payloads) {
+      assert.equal(payload.k, 'model', 'the same action kind carries both steps')
+      assert.equal(payload.s, 'feishu-abc')
+      assert.equal(payload.p, 'deepseek')
+      assert.equal(payload.m, 'pro')
+    }
+    assert.equal(buttons.filter((b) => b.text.content.startsWith('✓ ')).length, 1)
+    assert.match(buttons.find((b) => b.text.content.startsWith('✓ ')).text.content, /High/)
+    assert.match(JSON.stringify(card), /Low \(默认\)|Low（默认）/)
+  })
+  await check('the model picker only offers the effort step when there is one', () => {
+    const cat = {
+      default: { provider: 'deepseek', model: 'pro' },
+      groups: [{ id: 'deepseek', name: 'DeepSeek', models: [
+        { id: 'pro', name: 'Pro', reasoning: { efforts: [{ id: 'high', name: 'High' }] } },
+        { id: 'flash', name: 'Flash' },
+      ] }],
+      failures: [],
+    }
+    const onPro = JSON.stringify(buildModelCard({
+      catalog: cat, current: { provider: 'deepseek', model: 'pro', reasoningEffort: 'high' },
+      sessionId: 's', locale: 'zh',
+    }))
+    assert.match(onPro, /调整推理档位/)
+    // A model with no efforts gets no way in, rather than a dead-end picker.
+    const onFlash = JSON.stringify(buildModelCard({
+      catalog: cat, current: { provider: 'deepseek', model: 'flash' }, sessionId: 's', locale: 'zh',
+    }))
+    assert.doesNotMatch(onFlash, /调整推理档位/)
+  })
+  await check('an effort-less click on a model WITH efforts opens the picker instead', async () => {
+    // Applying the model default silently would be choosing on the user's behalf.
+    const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
+    const branch = indexSource.slice(indexSource.indexOf("if (typeof action.e !== 'string')"))
+    assert.match(branch.slice(0, 700), /buildEffortCard\(/)
+    assert.match(branch.slice(0, 700), /return \{ card: \{ type: 'raw', data: card \} \}/)
+    // And the typed form only sends the effort when one was asked for.
+    assert.match(indexSource, /if \(outcome\.effort !== undefined\) requested\.reasoningEffort = outcome\.effort/)
+  })
   await check('/model is advertised by this channel and in the Feishu panel', () => {
     assert.ok(OWN_PANEL_COMMANDS.some((c) => c.command === 'model'))
     for (const locale of ['zh', 'en']) {

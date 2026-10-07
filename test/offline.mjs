@@ -30,6 +30,7 @@ import {
 } from '../lib/card.js'
 import { TurnRenderer } from '../lib/turn.js'
 import { ConversationSessions, conversationKey, makeWorkspaceFiler, sessionIdFor } from '../lib/session.js'
+import { DESTRUCTIVE_COMMANDS, buildHelpCard, isDestructive } from '../lib/help-card.js'
 import {
   buildChoiceCard,
   choiceOptionValue,
@@ -46,7 +47,7 @@ import {
   selectableSessions,
   sessionLabel,
 } from '../lib/sessions-ui.js'
-import { commandName, helpText, isCommandLine, runCommandLine, strings } from '../lib/commands.js'
+import { commandName, helpText, isCommandLine, ownCommands, runCommandLine, strings } from '../lib/commands.js'
 import {
   buildEffortCard,
   buildModelCard,
@@ -2421,7 +2422,7 @@ async function main() {
     assert.match(apply.slice(0, 900), /agentPresetLocked\(agent\)/)
     // `/new` binds the rotated session so the card's callback is authorised.
     const newBlock = indexSource.slice(indexSource.indexOf("if (name === 'new')"))
-    assert.match(newBlock.slice(0, 1400), /sessions\.bind\(key, inbound\)/)
+    assert.match(newBlock.slice(0, 1400), /sessions\.bind\(key, \{ chatId, messageId: replyToMessageId \}\)/)
   })
   await check('/new defaults the preset, so skipping the picker is not a gap', async () => {
     // "Start without choosing" has to mean the default, and that must not depend on
@@ -2442,6 +2443,92 @@ async function main() {
       assert.ok(!lines.some((line) => line.includes('/preset')), `${locale} help must not list /preset`)
       assert.ok(lines.some((line) => line.includes('/new')), `${locale} help must mention /new`)
     }
+  })
+
+  // A text list tells you what exists; a card lets you run it. Feishu has no
+  // autocomplete, so the card is the only discoverability there is.
+  console.log('/help card')
+  const helpHostCommands = [
+    { name: 'export', description: 'Download this Session log as a ZIP archive' },
+    { name: 'feedback', description: 'Record feedback about this session' },
+    { name: 'restart', description: 'Restart the harness' },
+    { name: 'shutdown', description: 'Stop the harness' },
+  ]
+
+  await check('the channel owns one structured command list', () => {
+    // The text help and the card render the same list; two renderings of one fact
+    // drift apart.
+    const own = ownCommands('zh')
+    assert.ok(own.length >= 8)
+    for (const entry of own) {
+      assert.ok(entry.name && entry.description, 'every command needs a name and a description')
+      assert.ok(!entry.name.startsWith('/'), 'names are bare: the slash is presentation')
+    }
+    assert.deepEqual(
+      ownCommands('zh').map((c) => c.name),
+      strings('zh').pluginCommands.map((line) => /`\/([a-z]+)`/.exec(line)[1]),
+      'the rendered lines must come from the same list',
+    )
+  })
+  await check('destructive commands are recognised by name, not by prose', () => {
+    // The registry's description is prose for a human and cannot be relied on to
+    // mark danger.
+    for (const name of ['new', 'stop', 'restart', 'shutdown']) assert.equal(isDestructive(name), true, name)
+    for (const name of ['model', 'sessions', 'status', 'help']) assert.equal(isDestructive(name), false, name)
+    assert.equal(isDestructive(undefined), false)
+    assert.equal(DESTRUCTIVE_COMMANDS.has('new'), true)
+  })
+  await check('the help card offers a button per safe command and runs nothing else', () => {
+    const card = buildHelpCard({ own: ownCommands('zh'), host: helpHostCommands, sessionId: 'feishu-abc', locale: 'zh' })
+    assertValidCard(card, 'help card')
+    assert.deepEqual(invalidElementIds(card), [])
+    assert.deepEqual(duplicateElementIds(card), [])
+    const buttons = []
+    const walk = (node) => {
+      if (Array.isArray(node)) return node.forEach(walk)
+      if (!node || typeof node !== 'object') return
+      if (node.tag === 'button') buttons.push(node)
+      Object.values(node).forEach(walk)
+    }
+    walk(card)
+    const labels = buttons.map((b) => b.text.content)
+    // Every non-destructive command of BOTH sections is runnable.
+    for (const name of ['/model', '/sessions', '/switch', '/permission', '/status', '/help', '/export', '/feedback']) {
+      assert.ok(labels.includes(name), `${name} must be a button`)
+    }
+    // A mis-tap on these cannot be undone by looking at the result, so they are not.
+    for (const name of ['/new', '/stop', '/restart', '/shutdown']) {
+      assert.ok(!labels.includes(name), `${name} must NOT be a button`)
+    }
+    for (const button of buttons) {
+      const payload = button.behaviors[0].value
+      assert.equal(payload.k, 'run')
+      assert.equal(payload.s, 'feishu-abc')
+      assert.ok(!payload.c.startsWith('/'), 'the payload names the command without the slash')
+    }
+    // Stated, not silently omitted: a user who cannot find `/new` needs to know why.
+    assert.match(JSON.stringify(card), /需要手动输入/)
+    assert.match(JSON.stringify(card), /`\/new`/)
+  })
+  await check('the help card still renders with nothing to show', () => {
+    const card = buildHelpCard({ own: [], host: [], sessionId: 's', locale: 'zh' })
+    assertValidCard(card, 'empty help card')
+    assert.match(JSON.stringify(card), /没有可用的命令/)
+  })
+  await check('a help button runs through the SAME dispatcher as a typed command', async () => {
+    // A command that works when typed but fails when tapped is reported as "the
+    // button does nothing", so there is exactly one implementation.
+    const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
+    assert.match(indexSource, /await runCommand\(\{/)
+    const action = indexSource.slice(indexSource.indexOf("action.k === 'run'"))
+    const body = action.slice(0, action.indexOf("action.k === 'preset'"))
+    assert.match(body, /await runCommand\(\{/)
+    // The payload is a NAME, so anything that trusted it blindly could run an
+    // arbitrary line.
+    assert.match(body, /const offered = ownCommands\(resolved\.locale\)\.some/)
+    assert.match(body, /if \(!offered \|\| key === undefined\)/)
+    // And the text form survives as the fallback.
+    assert.match(indexSource, /help card failed; falling back to text/)
   })
 
   console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)

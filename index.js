@@ -22,7 +22,7 @@ import { FeishuTransport, readCardAction, readInboundMessage } from './lib/feish
 import { TurnRenderer } from './lib/turn.js'
 import { ConversationSessions, conversationKey, makeWorkspaceFiler } from './lib/session.js'
 import { CredentialStore, beginOnboarding, resolveStateDir } from './lib/onboarding.js'
-import { commandName, helpText, isCommandLine, runCommandLine, strings } from './lib/commands.js'
+import { commandName, helpText, isCommandLine, ownCommands, runCommandLine, strings } from './lib/commands.js'
 import { createLogger } from './lib/log.js'
 import { ReactionTracker } from './lib/react.js'
 import { Notices } from './lib/notice.js'
@@ -31,6 +31,7 @@ import { Fanout } from './lib/fanout.js'
 import { installToolGuard } from './lib/guard.js'
 import { buildSendFileTool, resolveSendablePath } from './lib/outbound.js'
 import { DROP, admit, isPolicyDrop } from './lib/access.js'
+import { buildHelpCard } from './lib/help-card.js'
 import {
   buildEffortCard,
   buildModelCard,
@@ -224,6 +225,228 @@ export async function apply(ctx, config = {}) {
 
   // --- inbound: a Feishu message drives one conversation -------------------
 
+  /**
+   * Answer one slash line for a conversation.
+   *
+   * Shared by an inbound message and a `/help` button: both end up running the same
+   * command for the same conversation, and they differ only in where the card goes.
+   * Keeping one implementation is what stops the two entry points from drifting —
+   * a command that works when typed but not when tapped is a bug users report as
+   * "the button does nothing".
+   */
+  const runCommand = async ({ name, text, key, agent, sessionId, chatId, replyToMessageId }) => {
+      let reply
+      if (name === 'new') {
+        // Rotating the session orphans every per-session structure keyed by the
+        // old id, so they are dropped with it rather than leaking until unload.
+        const previous = sessions.idFor(key)
+        progress.forget(previous)
+        notices.forget(previous)
+        fanout.forget(previous)
+        const rotated = await sessions.rotate(key)
+        // Bound here so the picker's callback is accepted: `serves()` is what
+        // authorises a card action, and it reads the routing that `bind` sets.
+        sessions.bind(key, { chatId, messageId: replyToMessageId })
+
+        // The preset is part of starting a session, not a separate command: it can
+        // only be chosen before the first turn, so the moment after `/new` is the
+        // only moment it is freely available.
+        const registry = ctx.get('agentPresets')
+        const options = registry && typeof registry.list === 'function'
+          ? presetOptions(await registry.list(), resolved.locale)
+          : []
+        if (options.length === 0) {
+          reply = { text: `${t.newSession}\n\n\`${rotated}\`` }
+        } else {
+          // Defaulted NOW rather than on the next message: "start without choosing"
+          // has to mean the default, and the promise must not depend on the user
+          // touching the picker.
+          const fallback = registry.defaultId && options.some((o) => o.value === registry.defaultId)
+            ? registry.defaultId
+            : options[0].value
+          pendingPresets.set(key, fallback)
+          const label = presetStrings(resolved.locale)
+          const fallbackName = options.find((o) => o.value === fallback)?.name ?? fallback
+          await transport.sendCardOnce(
+            buildChoiceCard({
+              title: label.presetTitle,
+              lead: label.newLead(rotated),
+              heading: label.newHeading,
+              currentLabel: label.newDefault(fallbackName),
+              currentValue: fallback,
+              placeholder: label.presetPlaceholder,
+              options,
+              behavior: { k: 'preset', s: rotated },
+              hint: label.presetHint,
+              emptyText: label.noPresets,
+              locale: resolved.locale,
+            }),
+            { chatId: chatId, replyToMessageId: replyToMessageId },
+          )
+          return
+        }
+      } else if (name === 'status') {        } else if (name === 'status') {
+        reply = {
+          text: `\`${sessionId}\`\n卡片：${renderer.has(sessionId) ? t.statusBusy : t.statusIdle}`,
+        }
+      } else if (name === 'permission') {
+        const t = presetStrings(resolved.locale)
+        const service = ctx.get('permissionPresets')
+        if (!service || typeof service.catalog !== 'function') {
+          reply = { error: true, text: t.noService }
+        } else {
+          const query = text.replace(/^\/permission\b/, '').trim()
+          const options = permissionOptions(service.catalog())
+          const outcome = resolveOptionQuery(query, options, resolved.locale)
+          if (outcome.list) {
+            if (options.length === 0) {
+              reply = { error: true, text: t.noPermission }
+            } else {
+              const currentName = service.current(agent.session)
+              await transport.sendCardOnce(
+                buildChoiceCard({
+                  title: t.permissionTitle,
+                  heading: t.permissionHeading,
+                  currentLabel: options.find((o) => o.value === currentName)?.name ?? (currentName || t.unknownPermission),
+                  currentValue: currentName,
+                  placeholder: t.permissionPlaceholder,
+                  options,
+                  behavior: { k: 'permission', s: sessionId },
+                  hint: t.permissionHint,
+                  emptyText: t.noPermission,
+                  locale: resolved.locale,
+                }),
+                { chatId: chatId, replyToMessageId: replyToMessageId },
+              )
+              return
+            }
+          } else if (outcome.error) {
+            reply = { error: true, text: `${outcome.error}\n\n${t.usage}` }
+          } else {
+            service.set(agent.session, outcome.option.value)
+            reply = { text: t.toast(outcome.option.name) }
+          }
+        }
+      } else if (name === 'sessions') {
+        const t = sessionStrings(resolved.locale)
+        const rows = await listSessions()
+        const { items, total } = selectableSessions({ summaries: rows, currentId: sessionId })
+        if (rows.length === 0 && items.length === 0) {
+          reply = { error: true, text: t.noList }
+        } else {
+          await transport.sendCardOnce(
+            buildSessionsCard({
+              items,
+              total,
+              currentId: sessionId,
+              sessionId,
+              locale: resolved.locale,
+            }),
+            { chatId: chatId, replyToMessageId: replyToMessageId },
+          )
+          return
+        }
+      } else if (name === 'switch') {
+        const t = sessionStrings(resolved.locale)
+        const query = text.replace(/^\/switch\b/, '').trim()
+        const outcome = resolveSessionQuery(query, await listSessions(), resolved.locale)
+        if (outcome.list || outcome.error) {
+          reply = { error: true, text: `${outcome.error ?? t.usage}` }
+        } else {
+          const target = outcome.item.sessionId
+          const result = await switchConversation(key, target, inbound)
+          const label = `${sessionLabel(outcome.item)} · \`${target}\``
+          reply = { text: result.unchanged ? t.already(label) : t.switched(label) }
+        }
+      } else if (name === 'model') {
+        const t = modelStrings(resolved.locale)
+        const catalog = await readModelCatalog()
+        if (!catalog) {
+          reply = { error: true, text: t.noController }
+        } else {
+          const query = text.replace(/^\/model\b/, '').trim()
+          const outcome = resolveModelQuery(query, catalog, resolved.locale)
+          if (outcome.list) {
+            // The picker IS the interface: Feishu has no autocomplete, so the
+            // models are buttons rather than something to type.
+            await transport.sendCardOnce(
+              buildModelCard({
+                catalog,
+                current: currentModelSelection(agent),
+                sessionId,
+                locale: resolved.locale,
+              }),
+              { chatId: chatId, replyToMessageId: replyToMessageId },
+            )
+            return
+          }
+          if (outcome.error) {
+            reply = { error: true, text: `${outcome.error}\n\n${t.usage}` }
+          } else {
+            const requested = {
+              sessionId,
+              provider: outcome.entry.provider,
+              model: outcome.entry.model,
+            }
+            // Absent means "leave the effort alone"; the host keeps whatever the
+            // session already had, so only send it when one was asked for.
+            if (outcome.effort !== undefined) requested.reasoningEffort = outcome.effort
+            const value = await ctx.get('sessionController').selectModel(requested)
+            reply = { text: t.switched(describeSelection(value?.selected ?? requested)) }
+          }
+        }
+      } else if (name === 'help') {
+        // A card, because a text list tells you what exists while a card lets you run
+        // it — and Feishu has no autocomplete to fall back on.
+        const registry = ctx.get('commands')
+        let host = []
+        try {
+          host = [...(registry?.list?.(agent) ?? [])]
+        } catch (error) {
+          logger.warn('[feishu-card] listing harness commands failed', error)
+        }
+        try {
+          await transport.sendCardOnce(
+            buildHelpCard({
+              own: ownCommands(resolved.locale),
+              host: host.map((entry) => ({ name: entry.name, description: entry.description })),
+              sessionId,
+              locale: resolved.locale,
+            }),
+            { chatId, replyToMessageId },
+          )
+        } catch (error) {
+          // The text form stays as the fallback: a help command that answers nothing
+          // is worse than one that answers without buttons.
+          logger.warn('[feishu-card] help card failed; falling back to text', error)
+          await transport.sendText(
+            await helpText({ commands: registry, agent, locale: resolved.locale, logger }),
+            { chatId, replyToMessageId },
+          )
+        }
+        return
+      } else {
+        reply = await runCommandLine({
+          commands: ctx.get('commands'),
+          agent,
+          line: text,
+          locale: resolved.locale,
+          logger,
+          signal: lifetime.signal,
+        })
+      }
+      await transport.sendCardOnce(
+        buildNoticeCard({
+          title: `DSH · /${name}`,
+          template: reply.error ? TEMPLATE.failed : TEMPLATE.neutral,
+          body: reply.text,
+        }),
+        { chatId: chatId, replyToMessageId: replyToMessageId },
+      )
+      return
+  }
+
+
   async function onMessage(data) {
     const inbound = readInboundMessage(data)
     if (!inbound) return
@@ -278,187 +501,15 @@ export async function apply(ctx, config = {}) {
       }
 
       if (isCommandLine(text)) {
-        const name = commandName(text)
-        let reply
-        if (name === 'new') {
-          // Rotating the session orphans every per-session structure keyed by the
-          // old id, so they are dropped with it rather than leaking until unload.
-          const previous = sessions.idFor(key)
-          progress.forget(previous)
-          notices.forget(previous)
-          fanout.forget(previous)
-          const rotated = await sessions.rotate(key)
-          // Bound here so the picker's callback is accepted: `serves()` is what
-          // authorises a card action, and it reads the routing that `bind` sets.
-          sessions.bind(key, inbound)
-
-          // The preset is part of starting a session, not a separate command: it can
-          // only be chosen before the first turn, so the moment after `/new` is the
-          // only moment it is freely available.
-          const registry = ctx.get('agentPresets')
-          const options = registry && typeof registry.list === 'function'
-            ? presetOptions(await registry.list(), resolved.locale)
-            : []
-          if (options.length === 0) {
-            reply = { text: `${t.newSession}\n\n\`${rotated}\`` }
-          } else {
-            // Defaulted NOW rather than on the next message: "start without choosing"
-            // has to mean the default, and the promise must not depend on the user
-            // touching the picker.
-            const fallback = registry.defaultId && options.some((o) => o.value === registry.defaultId)
-              ? registry.defaultId
-              : options[0].value
-            pendingPresets.set(key, fallback)
-            const label = presetStrings(resolved.locale)
-            const fallbackName = options.find((o) => o.value === fallback)?.name ?? fallback
-            await transport.sendCardOnce(
-              buildChoiceCard({
-                title: label.presetTitle,
-                lead: label.newLead(rotated),
-                heading: label.newHeading,
-                currentLabel: label.newDefault(fallbackName),
-                currentValue: fallback,
-                placeholder: label.presetPlaceholder,
-                options,
-                behavior: { k: 'preset', s: rotated },
-                hint: label.presetHint,
-                emptyText: label.noPresets,
-                locale: resolved.locale,
-              }),
-              { chatId: inbound.chatId, replyToMessageId: inbound.messageId },
-            )
-            return
-          }
-        } else if (name === 'status') {        } else if (name === 'status') {
-          reply = {
-            text: `\`${sessionId}\`\n卡片：${renderer.has(sessionId) ? t.statusBusy : t.statusIdle}`,
-          }
-        } else if (name === 'permission') {
-          const t = presetStrings(resolved.locale)
-          const service = ctx.get('permissionPresets')
-          if (!service || typeof service.catalog !== 'function') {
-            reply = { error: true, text: t.noService }
-          } else {
-            const query = text.replace(/^\/permission\b/, '').trim()
-            const options = permissionOptions(service.catalog())
-            const outcome = resolveOptionQuery(query, options, resolved.locale)
-            if (outcome.list) {
-              if (options.length === 0) {
-                reply = { error: true, text: t.noPermission }
-              } else {
-                const currentName = service.current(agent.session)
-                await transport.sendCardOnce(
-                  buildChoiceCard({
-                    title: t.permissionTitle,
-                    heading: t.permissionHeading,
-                    currentLabel: options.find((o) => o.value === currentName)?.name ?? (currentName || t.unknownPermission),
-                    currentValue: currentName,
-                    placeholder: t.permissionPlaceholder,
-                    options,
-                    behavior: { k: 'permission', s: sessionId },
-                    hint: t.permissionHint,
-                    emptyText: t.noPermission,
-                    locale: resolved.locale,
-                  }),
-                  { chatId: inbound.chatId, replyToMessageId: inbound.messageId },
-                )
-                return
-              }
-            } else if (outcome.error) {
-              reply = { error: true, text: `${outcome.error}\n\n${t.usage}` }
-            } else {
-              service.set(agent.session, outcome.option.value)
-              reply = { text: t.toast(outcome.option.name) }
-            }
-          }
-        } else if (name === 'sessions') {
-          const t = sessionStrings(resolved.locale)
-          const rows = await listSessions()
-          const { items, total } = selectableSessions({ summaries: rows, currentId: sessionId })
-          if (rows.length === 0 && items.length === 0) {
-            reply = { error: true, text: t.noList }
-          } else {
-            await transport.sendCardOnce(
-              buildSessionsCard({
-                items,
-                total,
-                currentId: sessionId,
-                sessionId,
-                locale: resolved.locale,
-              }),
-              { chatId: inbound.chatId, replyToMessageId: inbound.messageId },
-            )
-            return
-          }
-        } else if (name === 'switch') {
-          const t = sessionStrings(resolved.locale)
-          const query = text.replace(/^\/switch\b/, '').trim()
-          const outcome = resolveSessionQuery(query, await listSessions(), resolved.locale)
-          if (outcome.list || outcome.error) {
-            reply = { error: true, text: `${outcome.error ?? t.usage}` }
-          } else {
-            const target = outcome.item.sessionId
-            const result = await switchConversation(key, target, inbound)
-            const label = `${sessionLabel(outcome.item)} · \`${target}\``
-            reply = { text: result.unchanged ? t.already(label) : t.switched(label) }
-          }
-        } else if (name === 'model') {
-          const t = modelStrings(resolved.locale)
-          const catalog = await readModelCatalog()
-          if (!catalog) {
-            reply = { error: true, text: t.noController }
-          } else {
-            const query = text.replace(/^\/model\b/, '').trim()
-            const outcome = resolveModelQuery(query, catalog, resolved.locale)
-            if (outcome.list) {
-              // The picker IS the interface: Feishu has no autocomplete, so the
-              // models are buttons rather than something to type.
-              await transport.sendCardOnce(
-                buildModelCard({
-                  catalog,
-                  current: currentModelSelection(agent),
-                  sessionId,
-                  locale: resolved.locale,
-                }),
-                { chatId: inbound.chatId, replyToMessageId: inbound.messageId },
-              )
-              return
-            }
-            if (outcome.error) {
-              reply = { error: true, text: `${outcome.error}\n\n${t.usage}` }
-            } else {
-              const requested = {
-                sessionId,
-                provider: outcome.entry.provider,
-                model: outcome.entry.model,
-              }
-              // Absent means "leave the effort alone"; the host keeps whatever the
-              // session already had, so only send it when one was asked for.
-              if (outcome.effort !== undefined) requested.reasoningEffort = outcome.effort
-              const value = await ctx.get('sessionController').selectModel(requested)
-              reply = { text: t.switched(describeSelection(value?.selected ?? requested)) }
-            }
-          }
-        } else if (name === 'help') {
-          reply = { text: await helpText({ commands: ctx.get('commands'), agent, locale: resolved.locale, logger }) }
-        } else {
-          reply = await runCommandLine({
-            commands: ctx.get('commands'),
-            agent,
-            line: text,
-            locale: resolved.locale,
-            logger,
-            signal: lifetime.signal,
-          })
-        }
-        await transport.sendCardOnce(
-          buildNoticeCard({
-            title: name === 'help' ? 'DSH · 帮助' : `DSH · /${name}`,
-            template: reply.error ? TEMPLATE.failed : TEMPLATE.neutral,
-            body: reply.text,
-          }),
-          { chatId: inbound.chatId, replyToMessageId: inbound.messageId },
-        )
+        await runCommand({
+          name: commandName(text),
+          text,
+          key,
+          agent,
+          sessionId,
+          chatId: inbound.chatId,
+          replyToMessageId: inbound.messageId,
+        })
         return
       }
 
@@ -573,6 +624,38 @@ export async function apply(ctx, config = {}) {
       typeof name === 'string' && name.startsWith(CUSTOM_SUBMIT_PREFIX)
         ? name.slice(CUSTOM_SUBMIT_PREFIX.length)
         : undefined
+    // A `/help` button runs a command. It goes through the SAME dispatcher an inbound
+    // message uses, so a command cannot work when typed and fail when tapped.
+    if (action.k === 'run') {
+      const operatorId = operator?.openId ?? operator
+      if (resolved.approvers.length > 0 && (!operatorId || !resolved.approvers.includes(operatorId))) {
+        logger?.warn?.(`[feishu-card] refused a command tap from a non-approver (${operatorId})`)
+        return { toast: { type: 'warning', content: '无权操作' } }
+      }
+      const command = String(action.c ?? '')
+      const key = typeof action.s === 'string' ? sessions.keyOf(action.s) : undefined
+      // Only commands the card actually offered, and only for a live conversation:
+      // the payload is a name, so anything that trusted it blindly could run an
+      // arbitrary line.
+      const offered = ownCommands(resolved.locale).some((entry) => entry.name === command)
+      if (!offered || key === undefined) {
+        return { toast: { type: 'info', content: '该操作已失效' } }
+      }
+      const agent = await agentFor(action.s)
+      if (!agent) return { toast: { type: 'warning', content: '当前部署未提供该接口' } }
+      const routing = sessions.routingFor(action.s) ?? { chatId, messageId }
+      await runCommand({
+        name: command,
+        text: `/${command}`,
+        key,
+        agent,
+        sessionId: action.s,
+        chatId: routing.chatId,
+        replyToMessageId: routing.replyToMessageId ?? messageId,
+      })
+      return { toast: { type: 'success', content: `已执行 /${command}` } }
+    }
+
     // The two session-scoped choices share one branch: the behavior names the
     // conversation and the kind, the option names the value.
     // The two session-scoped choices share one branch: the behavior names the

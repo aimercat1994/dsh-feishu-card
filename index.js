@@ -31,6 +31,7 @@ import { Fanout } from './lib/fanout.js'
 import { installToolGuard } from './lib/guard.js'
 import { buildSendFileTool, resolveSendablePath } from './lib/outbound.js'
 import { DROP, admit, isPolicyDrop } from './lib/access.js'
+import { applyPanelSync, desiredPanelEntries, planPanelSync } from './lib/command-panel.js'
 import { failureNote, promptContent, resolveImages } from './lib/images.js'
 import { describeCall, describeDiff, formatTokens } from './lib/present.js'
 import { dirname, sep } from 'node:path'
@@ -138,6 +139,7 @@ export async function apply(ctx, config = {}) {
     onSession: async (sessionId, agent) => {
       // Both ladder rungs land here, so this is where per-agent setup belongs.
       ensureToolGuard(agent)
+      void syncCommandPanel(agent)
       await fileSession(sessionId)
     },
   })
@@ -681,6 +683,39 @@ export async function apply(ctx, config = {}) {
         }
       }
     })
+  }
+
+  /**
+   * Reconcile Feishu's slash-command picker with what this bot actually answers.
+   *
+   * Deferred to the first admitted message because the host's registry is queried
+   * PER AGENT (`commands.list(agent)`), and there is no agent before someone
+   * talks to the bot. Once per process is enough: the set only changes when the
+   * deployment does.
+   *
+   * This is what stops the picker from lying. The commands it listed before came
+   * from a plugin that had since been uninstalled, so half of them answered
+   * "unknown command" — the panel advertised capability that was gone.
+   */
+  let panelSynced = false
+  const syncCommandPanel = async (agent) => {
+    if (panelSynced || !resolved.commandPanel) return
+    panelSynced = true
+    try {
+      const registry = ctx.get('commands')
+      const hostCommands = registry && typeof registry.list === 'function' ? registry.list(agent) : []
+      const desired = desiredPanelEntries({ hostCommands })
+      const plan = planPanelSync({ existing: await transport.listSlashCommands(), desired })
+      const done = await applyPanelSync(plan, transport, logger)
+      logger.info(
+        `[feishu-card] slash-command panel synced: +${done.created} ~${done.updated} -${done.removed}`
+          + `${done.failed ? ` (${done.failed} failed)` : ''}`,
+      )
+    } catch (error) {
+      // Retry on the next message rather than staying out of sync for the process.
+      panelSynced = false
+      logger.warn('[feishu-card] could not sync the slash-command panel', error)
+    }
   }
 
   ctx.on('agent/created', (payload) => {

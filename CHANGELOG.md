@@ -422,6 +422,37 @@ Cordis 里 `ctx.config` **需要插件在 `inject` 里声明**才能访问；我
 
 断言 176 → 180。
 
+
+### 飞书斜杠命令面板：同步成真实支持的命令
+
+用户指出"飞书里输入斜杠会弹出一个选择指令的窗口"。**我上一轮说"原生命令面板做不了"是错的**——我只看了 SDK 就下结论（SDK 类型里 `slash_command` 出现 0 次），而裸调 REST 完全可用。
+
+**面板当时在骗人**：应用上挂着 **15 个命令，全部是已卸载的 lark-bridge 残留**，其中一个的描述直接写着"查看**桥**的当前配置"。而我的插件不实现 `/ws`、`/sessions`、`/schedules`、`/audit`、`/preset`、`/tools`、`/skills`、`/plugins`、`/context`——用户在面板里点一半是死路。
+
+**踩坑记录（这次最值得记的是排查方法）：**
+
+create 连续失败 12 次，错误只有 `99992402 field validation failed`。我据此推测"需要已发布的应用版本"（应用确实没有 `app_version_id`），还去查了发布 API——**全错**。真正的原因是请求体多包了一层：
+
+```json
+{ "slash_command": { "command": "x", "description": {...} } }   // ✗
+{ "command": "x", "description": { "default_value": "..." } }   // ✓ 扁平
+```
+
+v7 的其他接口都按资源名包一层，所以包 `slash_command` 是"合理猜测"；而平台**接受这个信封、再报字段缺失**，读起来像少了字段而不是信封错了。
+
+**转折点是把整个响应打出来**：`error.field_violations` 明确写着 `command is required` / `description is required`——而我明明传了。**只打印 `code`/`msg` 让我瞎试了 12 次**；这和这个项目里"卡片 API 的 ErrPath 藏在 `error.response.data`"是同一类教训：平台的诊断信息通常在错误体里，不在状态码里。
+
+**实现：**
+
+- `lib/command-panel.js`：`desiredPanelEntries()`（过滤平台会拒的名字——一次被拒会中断整个同步，留下半更新状态；本渠道自己的命令在重名时胜出）+ `planPanelSync()`（remove/create/**update**/keep，描述漂移用 update 而不是删了重建，避免 id 变动）+ `applyPanelSync()`（失败计数而非抛出——面板是装饰性的，一条被拒不该放弃其余）
+- `lib/feishu.js`：四个方法走 `client.request`（SDK 完全没建模这个 API）
+- 首次拿到 agent 时同步一次：宿主注册表是**按 agent** 查的（`commands.list(agent)`），而有人跟机器人说话之前没有 agent
+- 配置项 `commandPanel`（默认开，可关）
+
+**已执行清理**：删除 14 个残留（`/config` 之前做实验时已删），面板现为空，待首次消息后由插件写入真实集合。
+
+断言 180 → 186。
+
 ---
 
 ## 未完成

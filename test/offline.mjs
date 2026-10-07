@@ -47,6 +47,13 @@ import {
 import { Fanout, agentEndLine, agentStartLine, runEndLine, runStartLine, subagentLine } from '../lib/fanout.js'
 import { DENIAL_REASON, denialReason, installToolGuard } from '../lib/guard.js'
 import { DROP, admit, isPolicyDrop } from '../lib/access.js'
+import {
+  COMMAND_NAME,
+  OWN_PANEL_COMMANDS,
+  applyPanelSync,
+  desiredPanelEntries,
+  planPanelSync,
+} from '../lib/command-panel.js'
 import { collectStream, parsePostContent, sniffImageMediaType } from '../lib/media.js'
 import { SEND_FILE_TOOL, buildSendFileTool, isInside, resolveSendablePath } from '../lib/outbound.js'
 import { failureNote, promptContent, resolveImages } from '../lib/images.js'
@@ -1753,6 +1760,87 @@ async function main() {
     const reread = withStoredCredentials(resolveConfig({}), stored)
     assert.equal(hasCredentials(reread), true, 'the stored app must survive a re-read')
     assert.equal(reread.appId, 'cli_stored')
+  })
+
+  // Feishu's command picker is fed by commands registered on the APP, and nothing
+  // keeps that list in step with the bot: an uninstalled plugin leaves its commands
+  // behind, so the picker went on offering commands that answered "unknown command".
+  console.log('slash-command panel')
+  await check('the desired set drops names the platform would reject', () => {
+    // A rejected create aborts the whole sync, leaving the panel half-updated.
+    assert.equal(COMMAND_NAME.test('help'), true)
+    assert.equal(COMMAND_NAME.test('a_b2'), true)
+    assert.equal(COMMAND_NAME.test('has-dash'), false)
+    assert.equal(COMMAND_NAME.test('Upper'), false)
+    assert.equal(COMMAND_NAME.test('1leading'), false)
+    assert.equal(COMMAND_NAME.test('x'.repeat(21)), false)
+    const entries = desiredPanelEntries({ hostCommands: [
+      { name: 'model', description: 'pick a model' },
+      { name: 'has-dash', description: 'nope' },
+      { name: '  ', description: 'nope' },
+    ] })
+    assert.deepEqual(entries.map((e) => e.command), ['help', 'model', 'new', 'status', 'stop'])
+  })
+  await check("this channel's own commands win a name collision", () => {
+    // The plugin intercepts these before the host registry, so ours is what runs.
+    const entries = desiredPanelEntries({ hostCommands: [{ name: 'stop', description: 'host stop' }] })
+    assert.equal(entries.find((e) => e.command === 'stop').description, '停止当前任务')
+  })
+  await check('descriptions are tidied to one line and bounded', () => {
+    const entries = desiredPanelEntries({ hostCommands: [
+      { name: 'a', description: '  multi\n  line   text  ' },
+      { name: 'b', description: 'y'.repeat(80) },
+      { name: 'c' },
+    ] })
+    const by = Object.fromEntries(entries.map((e) => [e.command, e.description]))
+    assert.equal(by.a, 'multi line text')
+    assert.equal(by.b.length, 40)
+    assert.match(by.b, /…$/)
+    assert.equal(by.c, '（无说明）')
+  })
+  await check('the plan removes, creates, updates and keeps correctly', () => {
+    const plan = planPanelSync({
+      existing: [
+        { command: 'gone', command_id: '1', description: { default_value: 'old' } },
+        { command: 'same', command_id: '2', description: { default_value: 'unchanged' } },
+        { command: 'drift', command_id: '3', description: { default_value: 'before' } },
+      ],
+      desired: [
+        { command: 'same', description: 'unchanged' },
+        { command: 'drift', description: 'after' },
+        { command: 'fresh', description: 'new' },
+      ],
+    })
+    assert.deepEqual(plan.remove.map((i) => i.command), ['gone'])
+    assert.deepEqual(plan.keep, ['same'])
+    assert.deepEqual(plan.create, [{ command: 'fresh', description: 'new' }])
+    // Updated rather than recreated: churning ids would break anything holding one.
+    assert.deepEqual(plan.update, [{ id: '3', command: 'drift', description: 'after' }])
+  })
+  await check('an empty panel plans only creations, and an empty wish only removals', () => {
+    assert.equal(planPanelSync({ existing: [], desired: [{ command: 'x', description: 'd' }] }).create.length, 1)
+    const only = planPanelSync({ existing: [{ command: 'x', command_id: '1', description: { default_value: 'd' } }], desired: [] })
+    assert.equal(only.remove.length, 1)
+    assert.deepEqual(only.create, [])
+  })
+  await check('applying a plan counts failures instead of abandoning the rest', async () => {
+    // The panel is cosmetic; one refused command must not skip the other nine.
+    const seen = []
+    const transport = {
+      deleteSlashCommand: async (id) => { seen.push(`del:${id}`); if (id === 'bad') throw new Error('refused') },
+      updateSlashCommand: async (id) => { seen.push(`upd:${id}`) },
+      createSlashCommand: async (e) => { seen.push(`new:${e.command}`) },
+    }
+    const plan = {
+      remove: [{ command_id: 'bad' }, { command_id: 'ok' }],
+      update: [{ id: '3', command: 'd', description: 'x' }],
+      create: [{ command: 'c', description: 'x' }],
+    }
+    const warned = []
+    const done = await applyPanelSync(plan, transport, { warn: (...a) => warned.push(a) })
+    assert.deepEqual(done, { created: 1, updated: 1, removed: 1, failed: 1 })
+    assert.deepEqual(seen, ['del:bad', 'del:ok', 'upd:3', 'new:c'])
+    assert.equal(warned.length, 1)
   })
 
   console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)

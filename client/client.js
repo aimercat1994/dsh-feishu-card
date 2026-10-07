@@ -211,6 +211,7 @@ window.__ModuleLoader__.load({
           { name: 'notices', label: '重试/用量/压缩/任务通知', kind: 'boolean' },
           { name: 'pressureWarnTokens', label: '上下文用量告警阈值', kind: 'number', min: 0 },
           { name: 'autoResumeGoals', label: '自动重新武装 goal', kind: 'boolean' },
+          { name: 'commandPanel', label: '同步斜杠命令面板', kind: 'boolean' },
         ],
       },
     ]

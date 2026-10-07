@@ -179,6 +179,30 @@ ErrMsg: form's name is required and can not be empty string
 
 ---
 
+## 4b. 更新已发送的卡片消息
+
+两条路，**只靠一条都可能不生效**（内容相同、幂等，所以两条都带上没坏处）：
+
+| 路径 | 做法 |
+| --- | --- |
+| 回调响应带卡 | `{"toast": {...}, "card": {"type": "raw", "data": <完整卡片 JSON>}}` —— 平台为按钮点击设计的就地更新 |
+| 显式更新消息 | `PATCH /open-apis/im/v1/messages/{message_id}`，`data.content` 传卡片 JSON 字符串。SDK 里是 `im.v1.message.patch`，message_id 在回调的 `context.open_message_id` |
+
+**只回 toast 不重绘 = 用户看到的是"这一下没生效"**：卡片继续显示旧状态，比不响应更容易被误判为 bug。
+
+### 陷阱：`message.get` 不能用来验证卡片内容
+
+对 **JSON 2.0 卡片**，`GET /open-apis/im/v1/messages/{id}` 返回的是**降级后的兼容投影**：
+
+```json
+{"title":"DSH · 模型","elements":[[{"tag":"img","image_key":"img_v3_..."},
+ {"tag":"text","text":"请升级至最新版本客户端，以查看内容"}]]}
+```
+
+**里面没有卡片源码**——模型名、按钮、`✓` 标记全都不在。曾据此判断"更新没生效"，而 `message.patch` 当时返回的是 `code: 0 success`；**拿无效证据否定了正确的行为**。
+
+要验证卡片更新只能看客户端，或用 `update_time` 之类的间接信号。
+
 ## 5. API 清单
 
 ### CardKit（卡片实体）

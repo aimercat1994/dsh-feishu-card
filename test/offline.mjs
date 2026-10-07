@@ -2200,6 +2200,12 @@ async function main() {
     assert.match(indexSource, /channelTurns\.set\(sessionId, \(channelTurns\.get\(sessionId\) \?\? 0\) \+ 1\)/)
     assert.match(indexSource, /if \(!renderer\.has\(sessionId\) && \(channelTurns\.get\(sessionId\) \?\? 0\) > 0\) \{/)
     assert.match(indexSource, /const owed = channelTurns\.get\(sessionId\) \?\? 0/)
+    // A dispatch that throws must give the count back: left raised, the next turn in
+    // the session renders a card even when another frontend started it.
+    const dispatch = indexSource.slice(indexSource.indexOf('channelTurns.set(sessionId'))
+    const rollback = dispatch.indexOf('throw error')
+    assert.ok(rollback > 0 && rollback < 1400, 'the dispatch must roll the count back before rethrowing')
+    assert.match(dispatch.slice(0, rollback), /channelTurns\.delete\(sessionId\)/)
   })
   await check('the switch action is handled before the pending lookup', async () => {
     // Like the model buttons, it is stateless: no correlation entry exists, so the

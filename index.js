@@ -429,15 +429,25 @@ export async function apply(ctx, config = {}) {
       // Counted BEFORE the dispatch: `turn/start` can arrive while this await is
       // still settling, and an un-counted turn would then render nothing.
       channelTurns.set(sessionId, (channelTurns.get(sessionId) ?? 0) + 1)
-      await ctx.sessionController.prompt(
-        {
-          requestId: nextId(),
-          sessionId,
-          mode: 'queue',
-          content,
-        },
-        lifetime.signal,
-      )
+      try {
+        await ctx.sessionController.prompt(
+          {
+            requestId: nextId(),
+            sessionId,
+            mode: 'queue',
+            content,
+          },
+          lifetime.signal,
+        )
+      } catch (error) {
+        // The turn never started, so it owes nothing. Leaving the count raised would
+        // make the NEXT turn in this session render a card even when it came from
+        // another frontend — exactly the broadcast this counter exists to prevent.
+        const owed = channelTurns.get(sessionId) ?? 0
+        if (owed <= 1) channelTurns.delete(sessionId)
+        else channelTurns.set(sessionId, owed - 1)
+        throw error
+      }
     } catch (error) {
       logger?.error?.(`[feishu-card] handling an inbound message failed (${key})`, error)
       void reactions.show(inbound.messageId, 'fail')

@@ -493,6 +493,20 @@ ctx.sessionProjections.stateOf(agent.session, 'modelSelection')  → {lastUsed, 
 
 断言 196 → 198。
 
+
+### `/model`：切换后卡片收敛，不再提供选择
+
+用户确认的交互：**切换后卡片只显示当前模型**，不再列出可选项。
+
+理由成立：选择面板是为"做决定"存在的，决定做完还挂着，读起来像"没保存成功"；而回去再选的路径是一次明确的动作（重新发 `/model`），不是一次误触。
+
+- `buildModelCard({..., settled: true})` 渲染收敛形态：当前模型 + 一句"重新发送 `/model` 可重新选择"，**零按钮**
+- 只有切换后的重绘用 `settled`；`/model` 本身仍然给完整选择卡（断言把这一点也钉住了——反过来会让 `/model` 什么都改不了）
+
+**顺带修掉一个真缺陷**：`✓` 标记原先拿 `describeSelection` 的**渲染结果**（会追加 `" (high)"`）与按钮的 `provider/model` 比较，所以会话一旦带上 `reasoningEffort`，**`✓` 会完全消失**——恰好在配置最具体的时候。改为只比较 `provider`/`model`；effort 仍显示在顶部当前模型行。
+
+断言 198 → 201。
+
 ---
 
 ## 未完成

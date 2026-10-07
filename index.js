@@ -819,7 +819,7 @@ export async function apply(ctx, config = {}) {
   const repaintModelCard = async ({ messageId, sessionId, current }) => {
     const catalog = await readModelCatalog()
     if (!catalog) return undefined
-    const card = buildModelCard({ catalog, current, sessionId, locale: resolved.locale })
+    const card = buildModelCard({ catalog, current, sessionId, locale: resolved.locale, settled: true })
     // Two routes to the same place, because only one of them is guaranteed:
     // returning the card in the callback response is what the platform documents
     // for a button click, and patching the message works even where that is

@@ -1951,6 +1951,38 @@ async function main() {
     assertValidCard(empty, 'model card without models')
     assert.match(JSON.stringify(empty), /没有可用模型/)
   })
+  await check('a settled card shows the outcome and offers no more choices', () => {
+    // The picker is for deciding. Leaving it open after the decision reads as "not
+    // saved", and the way back is a deliberate `/model` rather than a mis-tap.
+    const card = buildModelCard({
+      catalog,
+      current: { provider: 'deepseek', model: 'pro' },
+      sessionId: 'feishu-abc',
+      locale: 'zh',
+      settled: true,
+    })
+    assertValidCard(card, 'settled model card')
+    assert.deepEqual(invalidElementIds(card), [])
+    assert.deepEqual(duplicateElementIds(card), [])
+    const text = JSON.stringify(card)
+    assert.equal((text.match(/"tag":"button"/g) ?? []).length, 0, 'no buttons once settled')
+    assert.match(text, /deepseek\/pro/)
+    assert.match(text, /重新发送/)
+    // The same shape in the other locale, since both are shipped.
+    const en = buildModelCard({
+      catalog, current: { provider: 'deepseek', model: 'pro' }, sessionId: 's', locale: 'en', settled: true,
+    })
+    assertValidCard(en, 'settled model card (en)')
+    assert.match(JSON.stringify(en), /Send `\/model` again/)
+  })
+  await check('only the switch repaint settles; the /model picker still offers choices', async () => {
+    // Getting this backwards would leave `/model` unable to change anything.
+    const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
+    const repaint = indexSource.slice(indexSource.indexOf('const repaintModelCard'))
+    assert.match(repaint.slice(0, 600), /settled: true/)
+    const picker = indexSource.slice(indexSource.indexOf("name === 'model'"))
+    assert.doesNotMatch(picker.slice(0, 900), /settled: true/)
+  })
   await check('the check mark ignores the reasoning effort', () => {
     // A button stands for a model, not for one effort level. Comparing the rendered
     // label (which appends " (high)") against a bare model would drop the mark

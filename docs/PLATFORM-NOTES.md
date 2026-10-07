@@ -98,6 +98,25 @@ ErrMsg: form's name is required and can not be empty string
 
 ---
 
+### `select_static`（下拉 / 底部抽屉）
+
+**在 2.0 里是 `body.elements` 的直接元素**——卡片 1.0 用来包它的 `action` 标签已从 V2 移除（用了报 200861，整卡建不出来）。HFC 的 `_select` 仍是 1.0 写法，不能照抄。
+
+```json
+{ "tag": "select_static",
+  "element_id": "mselect",
+  "placeholder": { "tag": "plain_text", "content": "选择模型" },
+  "options": [{ "text": { "tag": "plain_text", "content": "标签" }, "value": "值" }],
+  "behaviors": [{ "type": "callback", "value": { "k": "model", "s": "…" } }],
+  "initial_option": "值" }
+```
+
+- 带不带 `behaviors` 都能建卡（都实测过 `code=0`）
+- **选择的回传字段是 `action.option`**，不是 `action.value`——后者是 `behaviors` 自己的常量载荷。所以"选了什么"只能放在 **option 的 `value`** 里（本插件放 JSON），behavior 只做常量标记
+- `initial_option` 预选当前值；**必须精确匹配某个 option 的 `value`**，不匹配就等于没预选
+- 选项的 `text.content` 与 `value` 都非空，否则平台拒绝
+- 一张卡片的高度因此与选项数量无关——选项多时用它，而不是一行一个按钮
+
 ## 2. 已验证可用的元素形状
 
 ### 2.1 `collapsible_panel`（过程面板）

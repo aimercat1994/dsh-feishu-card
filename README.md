@@ -105,10 +105,10 @@ github:aimercat1994/dsh-feishu-card
 想锁定版本，用 release 标签（实测可用）：
 
 ```
-github:aimercat1994/dsh-feishu-card#v0.2.0
+github:aimercat1994/dsh-feishu-card#v0.3.0
 ```
 
-当前版本 **v0.2.0** — [Release 说明](https://github.com/aimercat1994/dsh-feishu-card/releases/tag/v0.2.0) · [变更历史](CHANGELOG.md)
+当前版本 **v0.3.0** — [Release 说明](https://github.com/aimercat1994/dsh-feishu-card/releases/tag/v0.3.0) · [变更历史](CHANGELOG.md)
 
 ### 等价的命令行做法
 

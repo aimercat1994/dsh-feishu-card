@@ -1909,7 +1909,7 @@ async function main() {
     assert.match(resolveModelQuery('deepseek/pro ultra', cat, 'zh').error, /找不到推理档位/)
     assert.match(resolveModelQuery('deepseek/flash high', cat, 'zh').error, /不支持推理档位/)
   })
-  await check('the effort picker marks the active effort and offers the default', () => {
+  await check('the effort picker preselects the active effort and offers the default', () => {
     const cat = {
       default: { provider: 'deepseek', model: 'pro' },
       groups: [{ id: 'deepseek', name: 'DeepSeek', models: [
@@ -1928,30 +1928,16 @@ async function main() {
     assertValidCard(card, 'effort card')
     assert.deepEqual(invalidElementIds(card), [])
     assert.deepEqual(duplicateElementIds(card), [])
-    const buttons = []
-    const walk = (node) => {
-      if (Array.isArray(node)) return node.forEach(walk)
-      if (!node || typeof node !== 'object') return
-      if (node.tag === 'button') buttons.push(node)
-      Object.values(node).forEach(walk)
-    }
-    walk(card)
-    // One per effort, plus an explicit "default" — which is a distinct outcome from
-    // "no effort recorded", so it cannot be folded into the effort list.
-    assert.equal(buttons.length, 3)
-    const payloads = buttons.map((b) => b.behaviors[0].value)
-    assert.deepEqual(payloads.map((p) => p.e), ['low', 'high', ''])
-    for (const payload of payloads) {
-      assert.equal(payload.k, 'model', 'the same action kind carries both steps')
-      assert.equal(payload.s, 'feishu-abc')
-      assert.equal(payload.p, 'deepseek')
-      assert.equal(payload.m, 'pro')
-    }
-    assert.equal(buttons.filter((b) => b.text.content.startsWith('✓ ')).length, 1)
-    assert.match(buttons.find((b) => b.text.content.startsWith('✓ ')).text.content, /High/)
-    assert.match(JSON.stringify(card), /Low \(默认\)|Low（默认）/)
+    const select = card.body.elements.find((el) => el.element_id === 'eselect')
+    // One per effort, plus an explicit "default" — a distinct outcome from "no
+    // effort recorded", so it cannot be folded into the effort list.
+    assert.deepEqual(select.options.map((o) => JSON.parse(o.value).e), ['low', 'high', ''])
+    assert.equal(select.initial_option, '{"e":"high"}')
+    // The model is carried by the behavior: the click decides only the effort.
+    assert.deepEqual(select.behaviors, [{ type: 'callback', value: { k: 'effort', s: 'feishu-abc', p: 'deepseek', m: 'pro' } }])
+    assert.match(JSON.stringify(select.options), /Low \(默认\)|Low（默认）/)
   })
-  await check('the model picker only offers the effort step when there is one', () => {
+  await check('the model picker only carries an effort select when there is one', () => {
     const cat = {
       default: { provider: 'deepseek', model: 'pro' },
       groups: [{ id: 'deepseek', name: 'DeepSeek', models: [
@@ -1960,25 +1946,26 @@ async function main() {
       ] }],
       failures: [],
     }
-    const onPro = JSON.stringify(buildModelCard({
+    const onPro = buildModelCard({
       catalog: cat, current: { provider: 'deepseek', model: 'pro', reasoningEffort: 'high' },
       sessionId: 's', locale: 'zh',
-    }))
-    assert.match(onPro, /调整推理档位/)
-    // A model with no efforts gets no way in, rather than a dead-end picker.
-    const onFlash = JSON.stringify(buildModelCard({
+    })
+    assert.ok(onPro.body.elements.some((el) => el.element_id === 'eselect'), 'adjustable in place')
+    // A model with no efforts gets no dead-end select.
+    const onFlash = buildModelCard({
       catalog: cat, current: { provider: 'deepseek', model: 'flash' }, sessionId: 's', locale: 'zh',
-    }))
-    assert.doesNotMatch(onFlash, /调整推理档位/)
+    })
+    assert.ok(!onFlash.body.elements.some((el) => el.element_id === 'eselect'))
   })
-  await check('an effort-less click on a model WITH efforts opens the picker instead', async () => {
-    // Applying the model default silently would be choosing on the user's behalf.
+  await check('a model WITH efforts opens the effort step instead of applying', async () => {
+    // Applying the model default silently would be choosing on the user's behalf —
+    // and the session's existing effort may not even be valid for the new model.
     const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
-    const branch = indexSource.slice(indexSource.indexOf("if (typeof action.e !== 'string')"))
+    const branch = indexSource.slice(indexSource.indexOf("if (efforts.length > 0)"))
     assert.match(branch.slice(0, 700), /buildEffortCard\(/)
     assert.match(branch.slice(0, 700), /return \{ card: \{ type: 'raw', data: card \} \}/)
-    // And the typed form only sends the effort when one was asked for.
-    assert.match(indexSource, /if \(outcome\.effort !== undefined\) requested\.reasoningEffort = outcome\.effort/)
+    // And the effort select sends the effort only when one was named.
+    assert.match(indexSource, /if \(effort !== ''\) requested\.reasoningEffort = effort/)
   })
   await check('/model is advertised by this channel and in the Feishu panel', () => {
     assert.ok(OWN_PANEL_COMMANDS.some((c) => c.command === 'model'))
@@ -2020,7 +2007,7 @@ async function main() {
     assert.match(resolveModelQuery('nope', catalog, 'en').error, /No model matches/)
     assert.equal(resolveModelQuery('   ', catalog, 'zh').list, true)
   })
-  await check('the picker card is valid and every model is a button', () => {
+  await check('the picker card is valid and its select names every model', () => {
     const card = buildModelCard({
       catalog,
       current: { provider: 'deepseek', model: 'flash' },
@@ -2029,29 +2016,20 @@ async function main() {
     })
     assertValidCard(card, 'model card')
     assert.deepEqual(invalidElementIds(card), [])
-    // Duplicate element ids are their own card rejection.
     assert.deepEqual(duplicateElementIds(card), [])
-    const buttons = []
-    const walk = (node) => {
-      if (Array.isArray(node)) return node.forEach(walk)
-      if (!node || typeof node !== 'object') return
-      if (node.tag === 'button') buttons.push(node)
-      Object.values(node).forEach(walk)
+    const select = card.body.elements.find((el) => el.element_id === 'mselect')
+    assert.ok(select, 'the models live in one select')
+    assert.equal(select.tag, 'select_static')
+    // A select reports only one string, so the intent travels as JSON in the value
+    // while the behavior stays a constant marker for the card.
+    assert.deepEqual(select.behaviors, [{ type: 'callback', value: { k: 'model', s: 'feishu-abc' } }])
+    assert.equal(select.options.length, flattenCatalog(catalog).length)
+    for (const option of select.options) {
+      const parsed = JSON.parse(option.value)
+      assert.ok(parsed.p && parsed.m, 'every option names a provider and a model')
     }
-    walk(card)
-    assert.equal(buttons.length, 3, 'one button per model')
-    const payloads = buttons.map((b) => b.behaviors[0].value)
-    for (const payload of payloads) {
-      assert.equal(payload.k, 'model')
-      // The session travels in the payload: the conversation key depends on the
-      // configured scope, and a click carries no thread to re-derive it from.
-      assert.equal(payload.s, 'feishu-abc')
-      assert.ok(payload.p && payload.m)
-    }
-    // The current model is marked, and only the current one.
-    const marked = buttons.filter((b) => b.text.content.startsWith('✓ '))
-    assert.equal(marked.length, 1)
-    assert.match(marked[0].text.content, /Flash/)
+    // The current model is preselected, so the dropdown opens where you are.
+    assert.deepEqual(JSON.parse(select.initial_option), { p: 'deepseek', m: 'flash' })
   })
   await check('a card with no current selection still builds, and an empty catalogue degrades', () => {
     const bare = buildModelCard({ catalog, current: undefined, sessionId: 'feishu-abc', locale: 'zh' })
@@ -2097,9 +2075,9 @@ async function main() {
     const picker = indexSource.slice(indexSource.indexOf("name === 'model'"))
     assert.doesNotMatch(picker.slice(0, 900), /settled: true/)
   })
-  await check('the check mark ignores the reasoning effort', () => {
-    // A button stands for a model, not for one effort level. Comparing the rendered
-    // label (which appends " (high)") against a bare model would drop the mark
+  await check('the preselect ignores the reasoning effort', () => {
+    // The option stands for a model, not for one effort level. Comparing the
+    // rendered label (which appends " (high)") would leave nothing preselected
     // exactly when the session is most specifically configured.
     const card = buildModelCard({
       catalog,
@@ -2107,19 +2085,25 @@ async function main() {
       sessionId: 'feishu-abc',
       locale: 'zh',
     })
-    const buttons = []
-    const walk = (node) => {
-      if (Array.isArray(node)) return node.forEach(walk)
-      if (!node || typeof node !== 'object') return
-      if (node.tag === 'button') buttons.push(node)
-      Object.values(node).forEach(walk)
-    }
-    walk(card)
-    const marked = buttons.filter((b) => b.text.content.startsWith('✓ '))
-    assert.equal(marked.length, 1, 'exactly one mark even with an effort set')
-    assert.match(marked[0].text.content, /Pro/)
-    // The effort still shows in the current-model line.
+    const select = card.body.elements.find((el) => el.element_id === 'mselect')
+    assert.deepEqual(JSON.parse(select.initial_option), { p: 'deepseek', m: 'pro' })
+    // The effort itself still shows, in the current-model line and in the effort
+    // select that rides along — which needs a catalogue where the model has one.
     assert.match(JSON.stringify(card), /deepseek\/pro \(high\)/)
+    const withEffort = {
+      default: { provider: 'deepseek', model: 'pro' },
+      groups: [{ id: 'deepseek', name: 'DeepSeek', models: [
+        { id: 'pro', name: 'Pro', reasoning: { efforts: [{ id: 'high', name: 'High' }] } },
+      ] }],
+      failures: [],
+    }
+    const card2 = buildModelCard({
+      catalog: withEffort,
+      current: { provider: 'deepseek', model: 'pro', reasoningEffort: 'high' },
+      sessionId: 'feishu-abc',
+      locale: 'zh',
+    })
+    assert.equal(card2.body.elements.find((el) => el.element_id === 'eselect').initial_option, '{"e":"high"}')
   })
   await check('a switch repaints the picker by BOTH routes', async () => {
     // A toast alone leaves the card claiming the previous model, which reads as
@@ -2209,7 +2193,7 @@ async function main() {
     assert.match(resolveSessionQuery('nope', sessionRows, 'zh').error, /找不到会话/)
     assert.equal(resolveSessionQuery('  ', sessionRows, 'zh').list, true)
   })
-  await check('the picker card is valid and every button names a target session', () => {
+  await check('the picker card is valid and its select names every session', () => {
     const { items, total } = selectableSessions({ summaries: sessionRows, currentId: 'feishu-oc_a-mux2' })
     const card = buildSessionsCard({
       items, total, currentId: 'feishu-oc_a-mux2', sessionId: 'feishu-oc_a-mux2', locale: 'zh',
@@ -2217,27 +2201,16 @@ async function main() {
     assertValidCard(card, 'sessions card')
     assert.deepEqual(invalidElementIds(card), [])
     assert.deepEqual(duplicateElementIds(card), [])
-    const buttons = []
-    const walk = (node) => {
-      if (Array.isArray(node)) return node.forEach(walk)
-      if (!node || typeof node !== 'object') return
-      if (node.tag === 'button') buttons.push(node)
-      Object.values(node).forEach(walk)
+    const select = card.body.elements.find((el) => el.element_id === 'sselect')
+    assert.equal(select.options.length, items.length)
+    for (const option of select.options) {
+      const parsed = JSON.parse(option.value)
+      // `t` is the target session; the behavior's `s` identifies the CONVERSATION.
+      assert.ok(items.some((row) => row.sessionId === parsed.t))
+      assert.ok(option.text.content.length > 0)
     }
-    walk(card)
-    assert.equal(buttons.length, items.length)
-    for (const button of buttons) {
-      const payload = button.behaviors[0].value
-      assert.equal(payload.k, 'session')
-      // `s` identifies the CONVERSATION (by the session it is on); `t` is the target.
-      assert.equal(payload.s, 'feishu-oc_a-mux2')
-      assert.ok(items.some((r) => r.sessionId === payload.t))
-    }
-    // The session in use is marked, and the running one is called out.
-    const labels = buttons.map((b) => b.text.content)
-    assert.equal(labels.filter((l) => l.includes('✓')).length, 1)
-    assert.ok(labels.some((l) => l.includes('▶')))
-    assert.ok(labels.every((l) => l.length <= 40), 'a label must fit a button')
+    assert.deepEqual(JSON.parse(select.initial_option), { t: 'feishu-oc_a-mux2' })
+    assert.deepEqual(select.behaviors, [{ type: 'callback', value: { k: 'session', s: 'feishu-oc_a-mux2' } }])
   })
   await check('a settled picker shows the outcome and offers no more choices', () => {
     const card = buildSessionsCard({

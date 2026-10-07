@@ -476,7 +476,7 @@ export async function apply(ctx, config = {}) {
   // --- inbound: a card button answers a pending interaction ----------------
 
   async function onCardAction(data) {
-    const { action, name, operator, formValue, chatId, messageId } = readCardAction(data)
+    const { action, name, operator, formValue, chatId, messageId, option } = readCardAction(data)
 
     // A form submit carries the submit button's `name` and the form's values, not
     // a callback `value` — so the correlation id is recovered from the name.
@@ -484,6 +484,49 @@ export async function apply(ctx, config = {}) {
       typeof name === 'string' && name.startsWith(CUSTOM_SUBMIT_PREFIX)
         ? name.slice(CUSTOM_SUBMIT_PREFIX.length)
         : undefined
+    // An effort select carries its model in the behavior and its choice in the
+    // option, so the two halves of the decision arrive together.
+    if (action.k === 'effort') {
+      const t = modelStrings(resolved.locale)
+      const operatorId = operator?.openId ?? operator
+      if (resolved.approvers.length > 0 && (!operatorId || !resolved.approvers.includes(operatorId))) {
+        logger?.warn?.(`[feishu-card] refused an effort click from a non-approver (${operatorId})`)
+        return { toast: { type: 'warning', content: '无权操作' } }
+      }
+      if (typeof action.s !== 'string' || !sessions.serves(action.s)) {
+        return { toast: { type: 'info', content: t.gone } }
+      }
+      const choice = parseChoice(option, action)
+      const effort = choice?.e
+      if (typeof action.p !== 'string' || typeof action.m !== 'string' || typeof effort !== 'string') {
+        return { toast: { type: 'info', content: t.gone } }
+      }
+      const controller = ctx.get('sessionController')
+      if (!controller || typeof controller.selectModel !== 'function') {
+        return { toast: { type: 'warning', content: t.noController } }
+      }
+      try {
+        const requested = { sessionId: action.s, provider: action.p, model: action.m }
+        // An empty effort means "let the model default apply" — a real choice, so it
+        // is sent as an explicit absence rather than dropped.
+        if (effort !== '') requested.reasoningEffort = effort
+        const value = await controller.selectModel(requested)
+        const selected = value?.selected ?? requested
+        const label = describeSelection(selected)
+        logger.info(`[feishu-card] model switched to ${label} for ${action.s}`)
+        const catalog = await readModelCatalog()
+        const card = catalog
+          ? buildModelCard({ catalog, current: selected, sessionId: action.s, locale: resolved.locale, settled: true })
+          : undefined
+        return card
+          ? { toast: { type: 'success', content: t.toastSwitched(label) }, card: { type: 'raw', data: card } }
+          : { toast: { type: 'success', content: t.toastSwitched(label) } }
+      } catch (error) {
+        logger.warn('[feishu-card] could not switch the reasoning effort', error)
+        return { toast: { type: 'error', content: '切换失败，详见日志' } }
+      }
+    }
+
     // A session button is STATELESS too: it names the conversation by the session
     // that conversation is on, so no correlation entry is needed and the card stays
     // live for as long as it is in the chat.
@@ -494,21 +537,23 @@ export async function apply(ctx, config = {}) {
         logger?.warn?.(`[feishu-card] refused a session click from a non-approver (${operatorId})`)
         return { toast: { type: 'warning', content: '无权操作' } }
       }
+      const choice = parseChoice(option, action)
+      const target = choice?.t ?? action.t
       const key = typeof action.s === 'string' ? sessions.keyOf(action.s) : undefined
-      if (key === undefined || typeof action.t !== 'string') {
+      if (key === undefined || typeof target !== 'string') {
         return { toast: { type: 'info', content: t.gone } }
       }
       try {
         // Where this conversation already answers; the clicked card is not an anchor.
         const routing = sessions.routingFor(action.s) ?? { chatId, messageId }
-        const result = await switchConversation(key, action.t, routing)
-        const target = (await listSessions()).find((row) => row.sessionId === action.t)
-        const label = target ? `${sessionLabel(target)} · \`${action.t}\`` : `\`${action.t}\``
+        const result = await switchConversation(key, target, routing)
+        const row = (await listSessions()).find((item) => item.sessionId === target)
+        const label = row ? `${sessionLabel(row)} · \`${target}\`` : `\`${target}\``
         const card = buildSessionsCard({
-          items: target ? [target] : [],
+          items: row ? [row] : [],
           total: 1,
-          currentId: action.t,
-          sessionId: action.t,
+          currentId: target,
+          sessionId: target,
           locale: resolved.locale,
           settled: true,
         })
@@ -542,26 +587,29 @@ export async function apply(ctx, config = {}) {
         return { toast: { type: 'warning', content: t.noController } }
       }
       try {
-        const requested = { sessionId: action.s, provider: action.p, model: action.m }
-        // `e` is what separates "apply this effort" from "still choosing": without
-        // it, a model that offers efforts opens the effort picker instead of being
-        // applied with a default the user never saw.
-        if (typeof action.e !== 'string') {
-          const catalog = await readModelCatalog()
-          const { efforts } = catalog ? effortsFor(catalog, action.p, action.m) : { efforts: [] }
-          if (efforts.length > 0) {
-            const card = buildEffortCard({
-              catalog,
-              current: await currentSelectionFor(action.s),
-              provider: action.p,
-              model: action.m,
-              sessionId: action.s,
-              locale: resolved.locale,
-            })
-            return { card: { type: 'raw', data: card } }
-          }
-        } else if (action.e !== '') {
-          requested.reasoningEffort = action.e
+        const choice = parseChoice(option, action)
+        const provider = choice?.p ?? action.p
+        const model = choice?.m ?? action.m
+        if (typeof provider !== 'string' || typeof model !== 'string') {
+          return { toast: { type: 'info', content: t.gone } }
+        }
+        const requested = { sessionId: action.s, provider, model }
+        // A model that offers efforts leaves a decision this click did not make, so
+        // the card becomes the effort picker rather than applying a default the user
+        // never saw. Applying the model alone is not an option either: the session's
+        // existing effort may not even be valid for it.
+        const catalog = await readModelCatalog()
+        const { efforts } = catalog ? effortsFor(catalog, provider, model) : { efforts: [] }
+        if (efforts.length > 0) {
+          const card = buildEffortCard({
+            catalog,
+            current: await currentSelectionFor(action.s),
+            provider,
+            model,
+            sessionId: action.s,
+            locale: resolved.locale,
+          })
+          return { card: { type: 'raw', data: card } }
         }
         const value = await controller.selectModel(requested)
         const selected = value?.selected ?? requested
@@ -968,6 +1016,37 @@ export async function apply(ctx, config = {}) {
    * one ends. A flag cleared at `turn/end` would lose it.
    */
   const channelTurns = new Map()
+
+  /**
+   * Read a select's choice.
+   *
+   * The option value is JSON because a select reports only one string: the intent
+   * (which model, which effort, which session) has to travel inside it, while the
+   * behavior value stays a constant marker for the card.
+   *
+   * @returns the parsed payload, or undefined when the value is absent or not JSON.
+   */
+  const parseChoice = (raw, action) => {
+    if (typeof raw !== 'string' || raw.length === 0) {
+      // A select whose choice cannot be read looks exactly like a click that did
+      // nothing, so record what DID arrive: the field name is the whole question.
+      if (action && (action.k === 'model' || action.k === 'effort' || action.k === 'session')) {
+        logger.warn(
+          `[feishu-card] select action without an option (k=${action.k}, fields=${Object.keys(action).join(',')})`,
+        )
+      }
+      return undefined
+    }
+    try {
+      const parsed = JSON.parse(raw)
+      return parsed && typeof parsed === 'object' ? parsed : undefined
+    } catch {
+      // Worth a line: a platform that reports the choice some other way would
+      // otherwise look exactly like a click that did nothing.
+      logger.warn(`[feishu-card] unreadable select option: ${raw.slice(0, 120)}`)
+      return undefined
+    }
+  }
 
   /** Every visible session row, newest first (the host orders them by activity). */
   const listSessions = async () => {

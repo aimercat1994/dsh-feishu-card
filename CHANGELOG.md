@@ -735,6 +735,22 @@ if (reply === undefined) {
 
 断言 239 → 240。
 
+
+### 参数引导与附件传命令
+
+**① 参数引导。** 宿主在 `CommandDescriptor.input.hint` 里声明命令的用法（`/goal` 是 `[<objective>|clear|edit <objective>|pause|resume]`）——描述是散文，**hint 才是唯一权威的"这条命令吃什么"**。
+
+- `/help` 卡片与文字帮助都渲染**完整用法形式**：`` `/goal [<objective>|clear|…]` — Set or view the goal… ``。只列名字会**藏起"一半命令要参数"这个事实**，用户只能靠猜错来发现。
+- **裸调用时把用法附在结果后面**：`/goal` 不带参数时，回答后面加一行 `用法：\`/goal <objective>\``。带了参数就不加——那时用户显然已经找到了形式，每次重复是噪音。失败时同样加（那正是最需要的时候）。
+
+`usage` 统一成**完整形式**（`/switch <id>`），与 `commandUsage()` 从宿主描述符推导出来的一致——**一种形状**，渲染方不必知道命令来自哪一侧。（第一版我写成了"只有 hint"，结果渲染时又拼了一次名字，输出 `/goal /goal [...]`。）
+
+**② 附件传命令。** `execute(agent, line, submittedAttachments, signal)` 的第三个参数一直被我传空数组——于是声明了 `input.attachments` 的命令（如 `/goal`）永远收不到图片，这个能力等于丢了。
+
+现在：命令声明了 `input.attachments` 才去下载图片并作为 `{type:'image', mediaType, data}` 传过去；**没声明就不下载**——先下再被拒会浪费字节，还会把拒绝推迟到用户已经无法被提示之后。宿主负责准入，本渠道只负责把声明允许的东西递过去。
+
+断言 240 → 244，其中三条是**行为断言**（用假的注册表直接跑 `runCommandLine`，检查附件确实被透传、用法确实只在裸调用时追加），不只是源码检查。
+
 ---
 
 ## 未完成

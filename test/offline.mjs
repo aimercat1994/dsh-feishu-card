@@ -2466,9 +2466,73 @@ async function main() {
     }
     assert.deepEqual(
       ownCommands('zh').map((c) => c.name),
-      strings('zh').pluginCommands.map((line) => /`\/([a-z]+)`/.exec(line)[1]),
+      strings('zh').pluginCommands.map((line) => /`\/([a-z]+)/.exec(line)[1]),
       'the rendered lines must come from the same list',
     )
+  })
+  await check('attachments are forwarded to the command that declared them', async () => {
+    const seen = []
+    const commands = {
+      list: () => [{ name: 'goal', description: 'x', input: { hint: '<objective>', attachments: true } }],
+      execute: async (agent, line, attachments) => {
+        seen.push({ line, attachments })
+        return { result: { kind: 'success', text: 'ok' } }
+      },
+    }
+    const submitted = [{ type: 'image', mediaType: 'image/png', data: 'AAAA' }]
+    await runCommandLine({
+      commands, agent: {}, line: '/goal ship it', locale: 'zh',
+      signal: new AbortController().signal, submittedAttachments: submitted,
+    })
+    assert.equal(seen.length, 1)
+    // The host admits or refuses them; the channel's job is to hand them over.
+    assert.deepEqual(seen[0].attachments, submitted)
+    assert.equal(seen[0].line, '/goal ship it')
+  })
+  await check('a bare invocation gets the usage, one with an argument does not', async () => {
+    // Without it the answer is often a plausible-looking list and the user never
+    // learns the command had a form at all. With it, every use is noise.
+    const commands = {
+      list: () => [{ name: 'goal', description: 'x', input: { hint: '<objective>' } }],
+      execute: async () => ({ result: { kind: 'success', text: '当前目标：无' } }),
+    }
+    const signal = new AbortController().signal
+    const bare = await runCommandLine({ commands, agent: {}, line: '/goal', locale: 'zh', signal })
+    assert.match(bare.text, /用法：`\/goal <objective>`/)
+    const withArg = await runCommandLine({ commands, agent: {}, line: '/goal 把文档写完', locale: 'zh', signal })
+    assert.doesNotMatch(withArg.text, /用法：/)
+    // A failing bare invocation gets it too — that is exactly when it is wanted.
+    const failing = {
+      list: commands.list,
+      execute: async () => ({ result: { kind: 'error', text: '需要一个目标' } }),
+    }
+    const bad = await runCommandLine({ commands: failing, agent: {}, line: '/goal', locale: 'zh', signal })
+    assert.match(bad.text, /需要一个目标/)
+    assert.match(bad.text, /用法：/)
+  })
+  await check('only a command that declares attachments downloads the images', async () => {
+    // Downloading first and being refused later would waste the bytes and move the
+    // rejection past the point where the user can be told.
+    const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
+    const call = indexSource.slice(indexSource.indexOf('if (isCommandLine(text)) {'))
+    const body = call.slice(0, 1600)
+    assert.match(body, /descriptor\?\.input\?\.attachments === true/)
+    assert.match(body, /await resolveImages\(/)
+    assert.match(body, /takes no attachments; ignoring/)
+  })
+  await check('a command that takes an argument shows its usage form', async () => {
+    // A bare list of names hides the fact that half of them take an argument, and the
+    // user only finds out by guessing wrong.
+    const { commandUsage } = await import('../lib/commands.js')
+    assert.equal(commandUsage({ name: 'goal', input: { hint: '[<objective>|clear]' } }), '/goal [<objective>|clear]')
+    assert.equal(commandUsage({ name: 'export' }), undefined, 'no hint means a bare command')
+    assert.equal(commandUsage({ name: 'x', input: { hint: '   ' } }), undefined, 'a blank hint is not a form')
+    // Own commands carry the SAME shape, so a renderer never has to know which side a
+    // command came from.
+    for (const entry of ownCommands('zh')) {
+      if (entry.usage !== undefined) assert.match(entry.usage, new RegExp(`^/${entry.name}\\b`), entry.name)
+    }
+    assert.ok(ownCommands('zh').find((c) => c.name === 'switch').usage.startsWith('/switch '))
   })
   await check('destructive commands are recognised by name, not by prose', () => {
     // The registry's description is prose for a human and cannot be relied on to

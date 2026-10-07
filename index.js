@@ -22,7 +22,16 @@ import { FeishuTransport, readCardAction, readInboundMessage } from './lib/feish
 import { TurnRenderer } from './lib/turn.js'
 import { ConversationSessions, conversationKey, makeWorkspaceFiler } from './lib/session.js'
 import { CredentialStore, beginOnboarding, resolveStateDir } from './lib/onboarding.js'
-import { commandName, helpText, isCommandLine, ownCommands, runCommandLine, strings } from './lib/commands.js'
+import {
+  commandName,
+  commandUsage,
+  findCommand,
+  helpText,
+  isCommandLine,
+  ownCommands,
+  runCommandLine,
+  strings,
+} from './lib/commands.js'
 import { createLogger } from './lib/log.js'
 import { ReactionTracker } from './lib/react.js'
 import { Notices } from './lib/notice.js'
@@ -234,7 +243,7 @@ export async function apply(ctx, config = {}) {
    * a command that works when typed but not when tapped is a bug users report as
    * "the button does nothing".
    */
-  const runCommand = async ({ name, text, key, agent, sessionId, chatId, replyToMessageId }) => {
+  const runCommand = async ({ name, text, key, agent, sessionId, chatId, replyToMessageId, submittedAttachments = [] }) => {
       let reply
       if (name === 'new') {
         // Rotating the session orphans every per-session structure keyed by the
@@ -409,7 +418,11 @@ export async function apply(ctx, config = {}) {
           await transport.sendCardOnce(
             buildHelpCard({
               own: ownCommands(resolved.locale),
-              host: host.map((entry) => ({ name: entry.name, description: entry.description })),
+              host: host.map((entry) => ({
+                name: entry.name,
+                description: entry.description,
+                usage: commandUsage(entry),
+              })),
               sessionId,
               locale: resolved.locale,
             }),
@@ -433,6 +446,7 @@ export async function apply(ctx, config = {}) {
           locale: resolved.locale,
           logger,
           signal: lifetime.signal,
+          submittedAttachments,
         })
       }
       if (reply === undefined) {
@@ -509,14 +523,37 @@ export async function apply(ctx, config = {}) {
       }
 
       if (isCommandLine(text)) {
+        const name = commandName(text)
+        // A command that declares `input.attachments` can take the images sent with
+        // it; the host admits them, and refuses them for one that does not — so this
+        // only downloads what the descriptor allows.
+        const descriptor = findCommand(ctx.get('commands'), agent, name)
+        let submittedAttachments = []
+        if (imageKeys.length > 0) {
+          if (descriptor?.input?.attachments === true) {
+            const images = await resolveImages({
+              imageKeys,
+              messageId: inbound.messageId,
+              transport,
+              attachments: ctx.get('attachments'),
+              limit: resolved.maxImagesPerMessage,
+              logger,
+            })
+            submittedAttachments = images.parts
+            if (images.failures.length > 0) logger.warn(`[feishu-card] ${images.failures.join('；')}`)
+          } else {
+            logger.info(`[feishu-card] /${name} takes no attachments; ignoring ${imageKeys.length} image(s)`)
+          }
+        }
         await runCommand({
-          name: commandName(text),
+          name,
           text,
           key,
           agent,
           sessionId,
           chatId: inbound.chatId,
           replyToMessageId: inbound.messageId,
+          submittedAttachments,
         })
         return
       }

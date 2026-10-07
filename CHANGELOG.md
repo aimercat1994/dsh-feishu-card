@@ -477,6 +477,22 @@ ctx.sessionProjections.stateOf(agent.session, 'modelSelection')  → {lastUsed, 
 
 断言 186 → 196。
 
+
+### 修：切换模型后卡片不更新（只回了 toast）
+
+用户反馈"切换后卡片消息的状态没变"。原因是我只回了 toast，**没有重绘卡片**——卡片继续显示旧模型和旧的 ✓ 标记，读起来就是"这一下没生效"。
+
+修法用**两条路**（内容相同，幂等，只靠一条都可能不生效）：
+
+1. **回调响应里带卡**：`{toast, card: {type:'raw', data: <卡片>}}`——平台为按钮点击设计的就地更新路径
+2. **显式更新消息**：`im.v1.message.patch`（"更新已发送的消息卡片的内容"），message_id 取自回调的 `context.open_message_id`（`readCardAction` 早就在返回它，是我没用）
+
+**顺带修掉一个真缺陷**：`#client` 只在 `start()` 里创建，所以**任何 API 方法在连接前调用都会炸**（`cannot read properties of undefined (reading 'im')`）——我的 slash-command 方法也有同样的隐患。改成按需创建（私有访问器），并加了断言。
+
+**验证方法本身也错了一次**：我用 `message.get` 读回内容来判断更新是否生效，结果看到 `code: 0 success` 却"内容没变"。真相是 **`message.get` 对 JSON 2.0 卡片返回降级兼容投影**（一张图 + "请升级至最新版本客户端"），里面根本没有卡片源码——模型名、按钮、✓ 全都不在。**我拿一个无效的证据去否定了正确的行为**，差点又去改对的东西。已写进 `docs/PLATFORM-NOTES.md`。
+
+断言 196 → 198。
+
 ---
 
 ## 未完成

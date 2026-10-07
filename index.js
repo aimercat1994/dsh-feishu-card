@@ -414,7 +414,7 @@ export async function apply(ctx, config = {}) {
   // --- inbound: a card button answers a pending interaction ----------------
 
   async function onCardAction(data) {
-    const { action, name, operator, formValue, chatId } = readCardAction(data)
+    const { action, name, operator, formValue, chatId, messageId } = readCardAction(data)
 
     // A form submit carries the submit button's `name` and the form's values, not
     // a callback `value` — so the correlation id is recovered from the name.
@@ -443,9 +443,15 @@ export async function apply(ctx, config = {}) {
       }
       try {
         const value = await controller.selectModel({ sessionId: action.s, provider: action.p, model: action.m })
-        const label = describeSelection(value?.selected ?? { provider: action.p, model: action.m })
+        const selected = value?.selected ?? { provider: action.p, model: action.m }
+        const label = describeSelection(selected)
         logger.info(`[feishu-card] model switched to ${label} for ${action.s}`)
-        return { toast: { type: 'success', content: t.toastSwitched(label) } }
+        // Rewrite the picker so it shows the new state: a toast alone leaves the
+        // card claiming the previous model, which reads as "the click did nothing".
+        const card = await repaintModelCard({ messageId, sessionId: action.s, current: selected })
+        return card
+          ? { toast: { type: 'success', content: t.toastSwitched(label) }, card: { type: 'raw', data: card } }
+          : { toast: { type: 'success', content: t.toastSwitched(label) } }
       } catch (error) {
         logger.warn('[feishu-card] could not switch the model', error)
         return { toast: { type: 'error', content: '切换失败，详见日志' } }
@@ -802,6 +808,30 @@ export async function apply(ctx, config = {}) {
       logger.warn('[feishu-card] could not read the model projection', error)
       return undefined
     }
+  }
+
+  /**
+   * Redraw a model picker after its selection changed.
+   *
+   * Failures are logged, never surfaced as the action's outcome: the model DID
+   * change, and reporting a repaint problem as a failed switch would be a lie.
+   */
+  const repaintModelCard = async ({ messageId, sessionId, current }) => {
+    const catalog = await readModelCatalog()
+    if (!catalog) return undefined
+    const card = buildModelCard({ catalog, current, sessionId, locale: resolved.locale })
+    // Two routes to the same place, because only one of them is guaranteed:
+    // returning the card in the callback response is what the platform documents
+    // for a button click, and patching the message works even where that is
+    // ignored. Both carry identical content, so applying both is harmless.
+    if (messageId) {
+      try {
+        await transport.updateCardMessage(messageId, card)
+      } catch (error) {
+        logger.warn('[feishu-card] could not patch the model picker message', error)
+      }
+    }
+    return card
   }
 
   /** The host's model catalogue, or `undefined` when this deployment has none. */

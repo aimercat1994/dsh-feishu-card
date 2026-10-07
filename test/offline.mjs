@@ -1951,6 +1951,31 @@ async function main() {
     assertValidCard(empty, 'model card without models')
     assert.match(JSON.stringify(empty), /没有可用模型/)
   })
+  await check('a switch repaints the picker by BOTH routes', async () => {
+    // A toast alone leaves the card claiming the previous model, which reads as
+    // "the click did nothing" — the exact complaint this fixes. Neither route is
+    // guaranteed on its own: the callback-response card is what the platform
+    // documents for a click, and patching the message covers where that is ignored.
+    const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
+    assert.match(indexSource, /card: \{ type: 'raw', data: card \}/)
+    assert.match(indexSource, /transport\.updateCardMessage\(/)
+    // The message id has to survive being read out of the callback.
+    // The message id is destructured out of the callback; dropping it would leave
+    // the patch with nothing to address.
+    assert.match(indexSource, /const \{[^}]*messageId[^}]*\} = readCardAction\(data\)/)
+    const transport = await readFile(new URL('lib/feishu.js', repoRoot), 'utf8')
+    assert.match(transport, /async updateCardMessage\(messageId, card\)/)
+    assert.match(transport, /im\.v1\.message\.patch/)
+    // A missing id must be loud here: silently skipping would look like a repaint.
+    assert.match(transport, /updateCardMessage needs a message id/)
+  })
+  await check('the SDK client is built lazily, so API calls work before start()', async () => {
+    // Building it only inside start() meant any API method called first failed with
+    // "cannot read properties of undefined (reading 'im')".
+    const transport = await readFile(new URL('lib/feishu.js', repoRoot), 'utf8')
+    assert.match(transport, /#ensureClient\(\)/)
+    assert.match(transport, /get #client\(\) \{\s*\n\s*return this\.#ensureClient\(\)/)
+  })
   await check('provider failures are surfaced rather than hidden', () => {
     const card = buildModelCard({
       catalog: { ...catalog, failures: [{ id: 'broken', name: 'Broken', message: 'no credentials' }] },

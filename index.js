@@ -261,6 +261,8 @@ export async function apply(ctx, config = {}) {
 
     try {
       const agent = await sessions.reach(key)
+      // Before the first prompt, which is the only moment the host accepts a preset.
+      await applyPendingPreset(key, agent)
       sessions.bind(key, inbound)
       sessions.refreshReplyAnchor(sessionId, inbound.messageId)
 
@@ -286,53 +288,50 @@ export async function apply(ctx, config = {}) {
           notices.forget(previous)
           fanout.forget(previous)
           const rotated = await sessions.rotate(key)
-          reply = { text: `${t.newSession}\n\n\`${rotated}\`` }
-        } else if (name === 'status') {
+          // Bound here so the picker's callback is accepted: `serves()` is what
+          // authorises a card action, and it reads the routing that `bind` sets.
+          sessions.bind(key, inbound)
+
+          // The preset is part of starting a session, not a separate command: it can
+          // only be chosen before the first turn, so the moment after `/new` is the
+          // only moment it is freely available.
+          const registry = ctx.get('agentPresets')
+          const options = registry && typeof registry.list === 'function'
+            ? presetOptions(await registry.list(), resolved.locale)
+            : []
+          if (options.length === 0) {
+            reply = { text: `${t.newSession}\n\n\`${rotated}\`` }
+          } else {
+            // Defaulted NOW rather than on the next message: "start without choosing"
+            // has to mean the default, and the promise must not depend on the user
+            // touching the picker.
+            const fallback = registry.defaultId && options.some((o) => o.value === registry.defaultId)
+              ? registry.defaultId
+              : options[0].value
+            pendingPresets.set(key, fallback)
+            const label = presetStrings(resolved.locale)
+            const fallbackName = options.find((o) => o.value === fallback)?.name ?? fallback
+            await transport.sendCardOnce(
+              buildChoiceCard({
+                title: label.presetTitle,
+                lead: label.newLead(rotated),
+                heading: label.newHeading,
+                currentLabel: label.newDefault(fallbackName),
+                currentValue: fallback,
+                placeholder: label.presetPlaceholder,
+                options,
+                behavior: { k: 'preset', s: rotated },
+                hint: label.presetHint,
+                emptyText: label.noPresets,
+                locale: resolved.locale,
+              }),
+              { chatId: inbound.chatId, replyToMessageId: inbound.messageId },
+            )
+            return
+          }
+        } else if (name === 'status') {        } else if (name === 'status') {
           reply = {
             text: `\`${sessionId}\`\n卡片：${renderer.has(sessionId) ? t.statusBusy : t.statusIdle}`,
-          }
-        } else if (name === 'preset') {
-          const t = presetStrings(resolved.locale)
-          const registry = ctx.get('agentPresets')
-          if (!registry || typeof registry.list !== 'function') {
-            reply = { error: true, text: t.noService }
-          } else if (agentPresetLocked(agent)) {
-            // A picker whose every choice would be refused is worse than the
-            // constraint itself, so this is an explanation, not a card.
-            reply = { error: true, text: t.locked }
-          } else {
-            const query = text.replace(/^\/preset\b/, '').trim()
-            const all = await registry.list()
-            const options = presetOptions(all)
-            const outcome = resolveOptionQuery(query, options, resolved.locale)
-            if (outcome.list) {
-              if (options.length === 0) {
-                reply = { error: true, text: t.noPresets }
-              } else {
-                const currentId = currentPreset(agent)
-                await transport.sendCardOnce(
-                  buildChoiceCard({
-                    title: t.presetTitle,
-                    heading: t.presetHeading,
-                    currentLabel: options.find((o) => o.value === currentId)?.name ?? currentId ?? t.unknownPreset,
-                    currentValue: currentId,
-                    placeholder: t.presetPlaceholder,
-                    options,
-                    behavior: { k: 'preset', s: sessionId },
-                    hint: t.presetHint,
-                    emptyText: t.noPresets,
-                    locale: resolved.locale,
-                  }),
-                  { chatId: inbound.chatId, replyToMessageId: inbound.messageId },
-                )
-                return
-              }
-            } else if (outcome.error) {
-              reply = { error: true, text: `${outcome.error}\n\n${t.usage}` }
-            } else {
-              await registry.select(agent, outcome.option.value)
-              reply = { text: t.toast(outcome.option.name) }
-            }
           }
         } else if (name === 'permission') {
           const t = presetStrings(resolved.locale)
@@ -576,6 +575,8 @@ export async function apply(ctx, config = {}) {
         : undefined
     // The two session-scoped choices share one branch: the behavior names the
     // conversation and the kind, the option names the value.
+    // The two session-scoped choices share one branch: the behavior names the
+    // conversation and the kind, the option names the value.
     if (action.k === 'preset' || action.k === 'permission') {
       const t = presetStrings(resolved.locale)
       const operatorId = operator?.openId ?? operator
@@ -590,46 +591,62 @@ export async function apply(ctx, config = {}) {
       if (typeof value !== 'string' || value.length === 0) {
         return { toast: { type: 'info', content: t.gone } }
       }
-      const agent = await agentFor(action.s)
-      if (!agent) return { toast: { type: 'warning', content: t.noService } }
       try {
         if (action.k === 'preset') {
           const registry = ctx.get('agentPresets')
           if (!registry || typeof registry.select !== 'function') {
             return { toast: { type: 'warning', content: t.noService } }
           }
-          // Re-checked here, not just when the card was built: the session may have
-          // started a turn since, and the host would refuse with a raw error.
-          if (agentPresetLocked(agent)) return { toast: { type: 'warning', content: t.locked } }
-          await registry.select(agent, value)
-        } else {
-          const service = ctx.get('permissionPresets')
-          if (!service || typeof service.set !== 'function') {
-            return { toast: { type: 'warning', content: t.noService } }
-          }
-          service.set(agent.session, value)
+          // REMEMBERED, not applied: right after `/new` the session does not exist
+          // yet, and the host only accepts a preset before its first turn — which is
+          // when it is created. Applying here would fail for the only case this card
+          // exists for.
+          const key = sessions.keyOf(action.s)
+          if (key === undefined) return { toast: { type: 'info', content: t.gone } }
+          pendingPresets.set(key, value)
+          const label = presetOptions(await registry.list(), resolved.locale)
+            .find((entry) => entry.value === value)?.name ?? value
+          logger.info(`[feishu-card] preset ${value} queued for ${action.s}`)
+          const card = buildChoiceCard({
+            title: t.presetTitle,
+            lead: t.newLead(action.s),
+            heading: t.newHeading,
+            currentLabel: label,
+            currentValue: value,
+            placeholder: t.presetPlaceholder,
+            options: [],
+            behavior: {},
+            settledText: t.newPicked(label),
+            emptyText: '',
+            settled: true,
+          })
+          return { toast: { type: 'success', content: t.toast(label) }, card: { type: 'raw', data: card } }
         }
-        const label = await choiceLabel(action.k, value, resolved.locale)
-        logger.info(`[feishu-card] ${action.k} switched to ${value} for ${action.s}`)
+        // Permissions are not deferred: they can be changed at any time, so the
+        // session existing or not makes no difference to when they apply.
+        const agent = await agentFor(action.s)
+        if (!agent) return { toast: { type: 'warning', content: t.noService } }
+        const service = ctx.get('permissionPresets')
+        if (!service || typeof service.set !== 'function') {
+          return { toast: { type: 'warning', content: t.noService } }
+        }
+        service.set(agent.session, value)
+        const label = permissionOptions(service.catalog()).find((entry) => entry.value === value)?.name ?? value
+        logger.info(`[feishu-card] permission switched to ${value} for ${action.s}`)
         const card = buildChoiceCard({
-          title: action.k === 'preset' ? t.presetTitle : t.permissionTitle,
-          heading: action.k === 'preset' ? t.presetHeading : t.permissionHeading,
+          title: t.permissionTitle,
+          heading: t.permissionHeading,
           currentLabel: label,
           currentValue: value,
-          placeholder: action.k === 'preset' ? t.presetPlaceholder : t.permissionPlaceholder,
+          placeholder: t.permissionPlaceholder,
           options: [],
           behavior: {},
-          settledText: action.k === 'preset' ? t.settledPreset(label) : t.settledPermission(label),
+          settledText: t.settledPermission(label),
           emptyText: '',
           settled: true,
         })
         return { toast: { type: 'success', content: t.toast(label) }, card: { type: 'raw', data: card } }
       } catch (error) {
-        // The lock is the one refusal a user can act on, so it is reported in full
-        // rather than as a generic failure.
-        if (error?.code === 'agent-preset/locked' || /already started/.test(String(error?.message ?? ''))) {
-          return { toast: { type: 'warning', content: t.locked } }
-        }
         logger.warn(`[feishu-card] could not switch the ${action.k}`, error)
         return { toast: { type: 'error', content: t.toastFailed } }
       }
@@ -1230,6 +1247,36 @@ export async function apply(ctx, config = {}) {
       return permissionOptions(service?.catalog?.()).find((option) => option.value === value)?.name ?? value
     } catch {
       return value || t.unknownPreset
+    }
+  }
+
+  /**
+   * The preset each freshly rotated conversation should start with.
+   *
+   * `/new` cannot apply it: the session does not exist until the next message reaches
+   * the ladder, and the host only accepts a preset before a session's first turn —
+   * which is exactly then. So the choice is remembered and applied at creation.
+   */
+  const pendingPresets = new Map()
+
+  /** Apply a remembered preset to a session that has not started yet. */
+  const applyPendingPreset = async (key, agent) => {
+    const wanted = pendingPresets.get(key)
+    if (wanted === undefined) return
+    const registry = ctx.get('agentPresets')
+    if (!registry || typeof registry.select !== 'function') {
+      pendingPresets.delete(key)
+      return
+    }
+    // Cleared either way: a session that already ran cannot take one, and retrying
+    // on every message would keep attempting the impossible.
+    pendingPresets.delete(key)
+    if (agentPresetLocked(agent)) return
+    try {
+      await registry.select(agent, wanted)
+      logger.info(`[feishu-card] session ${agent.id} started with preset ${wanted}`)
+    } catch (error) {
+      logger.warn(`[feishu-card] could not apply the preset ${wanted}`, error)
     }
   }
 

@@ -636,6 +636,28 @@ if (boundary.openTurnStartSeq !== null || boundary.lastTurn > 0)
 
 断言 220 → 229。
 
+
+### 预设并入 `/new`，选项全部中文化
+
+用户要求：选项都用中文；`/preset` 与 `/new` 合并——发完 `/new` 的卡片里直接选预设，默认标准模式，不选就直接开始对话。
+
+**合并的理由成立**：预设**只能在会话第一回合之前**选（宿主 `agent-preset/locked`），而"刚发完 `/new`"正是那个唯一时刻。做成两个命令，等于让用户自己去找那个时间窗。
+
+**实现上有一处绕不开的时序**：`/new` 只是轮换绑定，会话要到**下一条消息**才被创建（惰性阶梯），而 `select()` 需要 agent。所以选择是**记住**而不是立即应用：
+
+```js
+pendingPresets.set(key, fallback)      // /new 时写入，默认值此刻就定好
+await applyPendingPreset(key, agent)   // 下一条消息 reach 之后、首次 prompt 之前应用
+```
+
+**"不选就是标准"必须在 `/new` 时就把默认值写进去**，而不是等下一条消息再判断——否则这个承诺就依赖用户是否碰过选择器。默认取 `registry.defaultId`（本部署为 `standard`）。
+
+**顺带修掉一个会让卡片失效的问题**：`/new` 之后新会话还没有 routing，而卡片动作的授权检查是 `sessions.serves()`（读 routing）——不加 `sessions.bind(key, inbound)` 的话，这张卡片上的任何点击都会被判为"操作已失效"。
+
+**中文化**：宿主的内置预设**只有 id 没有显示名**（`standard` / `ptc` / `minimal`），权限预设同样是纯 id（`read-only` / `workspace-write` / `danger-full-access`）。所以加了两张映射表（标准模式 / PTC 模式 / 极简模式；只读 / 可写工作区 / 完全访问（危险）），**自定义预设自己的 name 仍然优先**（`梁神模式` 就来自它的 `preset.yml`）。
+
+断言 229 → 231。
+
 ---
 
 ## 未完成

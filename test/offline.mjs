@@ -1804,7 +1804,7 @@ async function main() {
       { name: 'has-dash', description: 'nope' },
       { name: '  ', description: 'nope' },
     ] })
-    assert.deepEqual(entries.map((e) => e.command), ['help', 'model', 'new', 'permission', 'preset', 'sessions', 'status', 'stop', 'switch'])
+    assert.deepEqual(entries.map((e) => e.command), ['help', 'model', 'new', 'permission', 'sessions', 'status', 'stop', 'switch'])
   })
   await check("this channel's own commands win a name collision", () => {
     // The plugin intercepts these before the host registry, so ours is what runs.
@@ -2327,6 +2327,20 @@ async function main() {
     assert.deepEqual(options.map((o) => o.value), ['a', 'b'])
     assert.deepEqual(presetOptions(undefined), [])
   })
+  await check('the built-in ids get Chinese names, a host name still wins', () => {
+    // The harness ships the built-ins as ids only, so a picker would read
+    // "standard / ptc / minimal" in an otherwise Chinese UI.
+    assert.deepEqual(
+      presetOptions([{ id: 'standard' }, { id: 'ptc' }, { id: 'minimal' }]).map((o) => o.name),
+      ['标准模式', 'PTC 模式', '极简模式'],
+    )
+    assert.equal(presetOptions([{ id: 'liangshen', name: '梁神模式' }])[0].name, '梁神模式')
+    assert.equal(presetOptions([{ id: 'custom' }])[0].name, 'custom', 'an unknown id falls back to itself')
+    assert.deepEqual(
+      permissionOptions({ options: [{ value: 'read-only' }, { value: 'workspace-write' }, { value: 'danger-full-access' }] }).map((o) => o.name),
+      ['只读', '可写工作区', '完全访问（危险）'],
+    )
+  })
   await check('permission options come from the catalog', () => {
     const options = permissionOptions({ options: [{ value: 'ask', name: 'Ask' }, { value: '', name: 'bad' }], defaultPreset: 'ask' })
     assert.deepEqual(options.map((o) => o.value), ['ask'])
@@ -2395,27 +2409,38 @@ async function main() {
     assertValidCard(card, 'empty choice card')
     assert.match(JSON.stringify(card), /没有可选/)
   })
-  await check('/preset explains the lock instead of offering a picker', async () => {
-    // Every choice would be refused, so the constraint itself is the answer.
+  await check('the preset is deferred to the next message, not applied by the card', async () => {
+    // Right after `/new` the session does not exist, and the host only accepts a
+    // preset before a session's first turn — which is when it is created.
     const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
-    const branch = indexSource.slice(indexSource.indexOf("name === 'preset'"))
-    assert.match(branch.slice(0, 500), /agentPresetLocked\(agent\)/)
-    assert.match(branch.slice(0, 500), /text: t\.locked/)
-    // And the action re-checks it, since the session may have started since the
-    // card was drawn.
     const action = indexSource.slice(indexSource.indexOf("action.k === 'preset' || action.k === 'permission'"))
-    const end = action.indexOf("action.k === 'effort'")
-    const body = end > 0 ? action.slice(0, end) : action.slice(0, 4000)
-    assert.match(body, /agentPresetLocked\(agent\)/)
-    assert.match(body, /agent-preset\/locked/)
+    assert.match(action.slice(0, 1600), /pendingPresets\.set\(key, value\)/)
+    // Applied at creation, before the first prompt.
+    assert.match(indexSource, /await applyPendingPreset\(key, agent\)/)
+    const apply = indexSource.slice(indexSource.indexOf('const applyPendingPreset'))
+    assert.match(apply.slice(0, 900), /agentPresetLocked\(agent\)/)
+    // `/new` binds the rotated session so the card's callback is authorised.
+    const newBlock = indexSource.slice(indexSource.indexOf("if (name === 'new')"))
+    assert.match(newBlock.slice(0, 1400), /sessions\.bind\(key, inbound\)/)
   })
-  await check('/preset and /permission are advertised by the channel', () => {
-    assert.ok(OWN_PANEL_COMMANDS.some((c) => c.command === 'preset'))
+  await check('/new defaults the preset, so skipping the picker is not a gap', async () => {
+    // "Start without choosing" has to mean the default, and that must not depend on
+    // the user touching the picker.
+    const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
+    const newBlock = indexSource.slice(indexSource.indexOf("if (name === 'new')"))
+    assert.match(newBlock.slice(0, 2200), /pendingPresets\.set\(key, fallback\)/)
+    assert.match(newBlock.slice(0, 2200), /registry\.defaultId/)
+  })
+  await check('/permission is advertised, and /preset is gone (it merged into /new)', () => {
     assert.ok(OWN_PANEL_COMMANDS.some((c) => c.command === 'permission'))
+    // The preset picker is part of `/new` now: a separate command would be a second
+    // way in, and the only moment it works is the moment `/new` creates.
+    assert.ok(!OWN_PANEL_COMMANDS.some((c) => c.command === 'preset'))
     for (const locale of ['zh', 'en']) {
       const lines = strings(locale).pluginCommands
-      assert.ok(lines.some((line) => line.includes('/preset')), `${locale} help must list /preset`)
       assert.ok(lines.some((line) => line.includes('/permission')), `${locale} help must list /permission`)
+      assert.ok(!lines.some((line) => line.includes('/preset')), `${locale} help must not list /preset`)
+      assert.ok(lines.some((line) => line.includes('/new')), `${locale} help must mention /new`)
     }
   })
 

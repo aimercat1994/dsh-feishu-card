@@ -32,6 +32,13 @@ import { installToolGuard } from './lib/guard.js'
 import { buildSendFileTool, resolveSendablePath } from './lib/outbound.js'
 import { DROP, admit, isPolicyDrop } from './lib/access.js'
 import { buildModelCard, describeSelection, modelStrings, resolveModelQuery } from './lib/model.js'
+import {
+  buildSessionsCard,
+  resolveSessionQuery,
+  selectableSessions,
+  sessionLabel,
+  sessionStrings,
+} from './lib/sessions-ui.js'
 import { applyPanelSync, desiredPanelEntries, planPanelSync } from './lib/command-panel.js'
 import { failureNote, promptContent, resolveImages } from './lib/images.js'
 import { describeCall, describeDiff, formatTokens } from './lib/present.js'
@@ -268,6 +275,37 @@ export async function apply(ctx, config = {}) {
           reply = {
             text: `\`${sessionId}\`\n卡片：${renderer.has(sessionId) ? t.statusBusy : t.statusIdle}`,
           }
+        } else if (name === 'sessions') {
+          const t = sessionStrings(resolved.locale)
+          const rows = await listSessions()
+          const { items, total } = selectableSessions({ summaries: rows, currentId: sessionId })
+          if (rows.length === 0 && items.length === 0) {
+            reply = { error: true, text: t.noList }
+          } else {
+            await transport.sendCardOnce(
+              buildSessionsCard({
+                items,
+                total,
+                currentId: sessionId,
+                sessionId,
+                locale: resolved.locale,
+              }),
+              { chatId: inbound.chatId, replyToMessageId: inbound.messageId },
+            )
+            return
+          }
+        } else if (name === 'switch') {
+          const t = sessionStrings(resolved.locale)
+          const query = text.replace(/^\/switch\b/, '').trim()
+          const outcome = resolveSessionQuery(query, await listSessions(), resolved.locale)
+          if (outcome.list || outcome.error) {
+            reply = { error: true, text: `${outcome.error ?? t.usage}` }
+          } else {
+            const target = outcome.item.sessionId
+            const result = await switchConversation(key, target, inbound)
+            const label = `${sessionLabel(outcome.item)} · \`${target}\``
+            reply = { text: result.unchanged ? t.already(label) : t.switched(label) }
+          }
         } else if (name === 'model') {
           const t = modelStrings(resolved.locale)
           const catalog = await readModelCatalog()
@@ -422,6 +460,44 @@ export async function apply(ctx, config = {}) {
       typeof name === 'string' && name.startsWith(CUSTOM_SUBMIT_PREFIX)
         ? name.slice(CUSTOM_SUBMIT_PREFIX.length)
         : undefined
+    // A session button is STATELESS too: it names the conversation by the session
+    // that conversation is on, so no correlation entry is needed and the card stays
+    // live for as long as it is in the chat.
+    if (action.k === 'session') {
+      const t = sessionStrings(resolved.locale)
+      const operatorId = operator?.openId ?? operator
+      if (resolved.approvers.length > 0 && (!operatorId || !resolved.approvers.includes(operatorId))) {
+        logger?.warn?.(`[feishu-card] refused a session click from a non-approver (${operatorId})`)
+        return { toast: { type: 'warning', content: '无权操作' } }
+      }
+      const key = typeof action.s === 'string' ? sessions.keyOf(action.s) : undefined
+      if (key === undefined || typeof action.t !== 'string') {
+        return { toast: { type: 'info', content: t.gone } }
+      }
+      try {
+        // Where this conversation already answers; the clicked card is not an anchor.
+        const routing = sessions.routingFor(action.s) ?? { chatId, messageId }
+        const result = await switchConversation(key, action.t, routing)
+        const target = (await listSessions()).find((row) => row.sessionId === action.t)
+        const label = target ? `${sessionLabel(target)} · \`${action.t}\`` : `\`${action.t}\``
+        const card = buildSessionsCard({
+          items: target ? [target] : [],
+          total: 1,
+          currentId: action.t,
+          sessionId: action.t,
+          locale: resolved.locale,
+          settled: true,
+        })
+        return {
+          toast: { type: 'success', content: result.unchanged ? t.already(label) : t.toastSwitched },
+          card: { type: 'raw', data: card },
+        }
+      } catch (error) {
+        logger.warn('[feishu-card] could not switch the conversation', error)
+        return { toast: { type: 'error', content: t.toastFailed } }
+      }
+    }
+
     // A model button is STATELESS: it carries the session it applies to, so it
     // needs no correlation entry and stays live for as long as the card does. It
     // is handled before the lookup below, which would otherwise reject it.
@@ -832,6 +908,44 @@ export async function apply(ctx, config = {}) {
       }
     }
     return card
+  }
+
+  /** Every visible session row, newest first (the host orders them by activity). */
+  const listSessions = async () => {
+    const controller = ctx.get('sessionController')
+    if (!controller || typeof controller.list !== 'function') return []
+    try {
+      const page = await controller.list({}, lifetime.signal)
+      return page?.items ?? []
+    } catch (error) {
+      logger.warn('[feishu-card] could not list sessions', error)
+      return []
+    }
+  }
+
+  /**
+   * Move a conversation onto another session.
+   *
+   * `/new` mints an id and is a one-way door; this adopts one that already exists,
+   * so a conversation can go back to an earlier session or continue one that began
+   * in the Web UI.
+   *
+   * The per-session accumulators of the session being LEFT are dropped: that
+   * session is no longer served here, and leaving them would leak until unload.
+   * The target's are deliberately NOT touched — it may be live in another chat.
+   */
+  const switchConversation = async (key, target, routing) => {
+    const previous = sessions.idFor(key)
+    if (previous === target) return { unchanged: true }
+    progress.forget(previous)
+    notices.forget(previous)
+    fanout.forget(previous)
+    await sessions.use(key, target)
+    // Keep answering where the conversation already answered, rather than to the
+    // card that happened to be clicked.
+    sessions.bind(key, routing)
+    logger.info(`[feishu-card] conversation moved from ${previous} to ${target}`)
+    return { previous }
   }
 
   /** The host's model catalogue, or `undefined` when this deployment has none. */

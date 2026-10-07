@@ -30,6 +30,14 @@ import {
 } from '../lib/card.js'
 import { TurnRenderer } from '../lib/turn.js'
 import { ConversationSessions, conversationKey, makeWorkspaceFiler, sessionIdFor } from '../lib/session.js'
+import {
+  SESSION_LIMIT,
+  buildSessionsCard,
+  relativeTime,
+  resolveSessionQuery,
+  selectableSessions,
+  sessionLabel,
+} from '../lib/sessions-ui.js'
 import { commandName, helpText, isCommandLine, runCommandLine, strings } from '../lib/commands.js'
 import {
   buildModelCard,
@@ -1786,7 +1794,7 @@ async function main() {
       { name: 'has-dash', description: 'nope' },
       { name: '  ', description: 'nope' },
     ] })
-    assert.deepEqual(entries.map((e) => e.command), ['help', 'model', 'new', 'status', 'stop'])
+    assert.deepEqual(entries.map((e) => e.command), ['help', 'model', 'new', 'sessions', 'status', 'stop', 'switch'])
   })
   await check("this channel's own commands win a name collision", () => {
     // The plugin intercepts these before the host registry, so ours is what runs.
@@ -2041,6 +2049,156 @@ async function main() {
     })
     assertValidCard(card, 'model card with failures')
     assert.match(JSON.stringify(card), /no credentials/)
+  })
+
+  // `/new` mints an id and is a one-way door; these commands make the binding
+  // visible and reversible.
+  console.log('session picker')
+  const NOW = Date.now()
+  const sessionRows = [
+    { sessionId: 'feishu-oc_a-mux1', updatedAt: NOW - 30_000, cwd: '/w/aimercat', projections: { values: { title: '重构卡片渲染' } } },
+    { sessionId: 'feishu-oc_a-mux2', updatedAt: NOW - 3_600_000, running: true, projections: { values: { title: '部署排查' } } },
+    { sessionId: 'feishu-oc_a-mux3', updatedAt: NOW - 90_000_000, blank: true },
+    { sessionId: 'feishu-oc_a-mux4', updatedAt: NOW - 120_000, origin: 'subagent' },
+    { sessionId: 'other-xyz', updatedAt: NOW - 5_000, projections: { values: { title: 'Web UI 会话' } } },
+  ]
+
+  await check('the picker hides machinery and unused sessions, newest first', () => {
+    const { items, total } = selectableSessions({ summaries: sessionRows, currentId: 'feishu-oc_a-mux2' })
+    // A blank session was never used and a subagent one is machinery; neither is
+    // something a person means to switch to.
+    assert.deepEqual(items.map((r) => r.sessionId), ['other-xyz', 'feishu-oc_a-mux1', 'feishu-oc_a-mux2'])
+    assert.equal(total, 3)
+    assert.ok(!items.some((r) => r.sessionId.endsWith('mux3')))
+    assert.ok(!items.some((r) => r.sessionId.endsWith('mux4')))
+  })
+  await check('the current session survives the filter, and the list is capped', () => {
+    // A picker that omits where you already are is confusing.
+    const { items } = selectableSessions({ summaries: sessionRows, currentId: 'feishu-oc_a-mux3' })
+    assert.ok(items.some((r) => r.sessionId.endsWith('mux3')), 'a blank CURRENT session must still be listed')
+    const many = Array.from({ length: 20 }, (_, i) => ({ sessionId: `feishu-s${i}`, updatedAt: NOW - i }))
+    const capped = selectableSessions({ summaries: many, currentId: 'feishu-s0' })
+    assert.equal(capped.items.length, SESSION_LIMIT)
+    assert.equal(capped.total, 20)
+  })
+  await check('a session is labelled by its title, else by its id tail', () => {
+    assert.equal(sessionLabel(sessionRows[0]), '重构卡片渲染')
+    assert.equal(sessionLabel({ sessionId: 'feishu-abcdef' }), 'abcdef')
+    assert.equal(sessionLabel({ sessionId: 'feishu-abcdef', projections: { values: { title: '   ' } } }), 'abcdef')
+  })
+  await check('relative time is coarse and never negative', () => {
+    assert.equal(relativeTime(NOW - 10_000, NOW, 'zh'), '刚刚')
+    assert.equal(relativeTime(NOW - 5 * 60_000, NOW, 'zh'), '5 分钟前')
+    assert.equal(relativeTime(NOW - 3 * 3_600_000, NOW, 'zh'), '3 小时前')
+    assert.equal(relativeTime(NOW - 2 * 86_400_000, NOW, 'en'), '2d ago')
+    assert.equal(relativeTime(NOW + 5_000, NOW, 'zh'), '刚刚', 'a clock skew must not read as negative')
+    assert.equal(relativeTime(undefined, NOW, 'zh'), '')
+  })
+  await check('a typed id resolves exactly, by prefix, or refuses when ambiguous', () => {
+    // Binding a conversation to the wrong session is not something the user can see
+    // happened, so an ambiguous prefix is refused rather than guessed.
+    assert.equal(resolveSessionQuery('feishu-oc_a-mux1', sessionRows, 'zh').item.sessionId, 'feishu-oc_a-mux1')
+    assert.equal(resolveSessionQuery('mux1', sessionRows, 'zh').item.sessionId, 'feishu-oc_a-mux1')
+    assert.match(resolveSessionQuery('mux', sessionRows, 'zh').error, /匹配到多个会话/)
+    assert.match(resolveSessionQuery('nope', sessionRows, 'zh').error, /找不到会话/)
+    assert.equal(resolveSessionQuery('  ', sessionRows, 'zh').list, true)
+  })
+  await check('the picker card is valid and every button names a target session', () => {
+    const { items, total } = selectableSessions({ summaries: sessionRows, currentId: 'feishu-oc_a-mux2' })
+    const card = buildSessionsCard({
+      items, total, currentId: 'feishu-oc_a-mux2', sessionId: 'feishu-oc_a-mux2', locale: 'zh',
+    })
+    assertValidCard(card, 'sessions card')
+    assert.deepEqual(invalidElementIds(card), [])
+    assert.deepEqual(duplicateElementIds(card), [])
+    const buttons = []
+    const walk = (node) => {
+      if (Array.isArray(node)) return node.forEach(walk)
+      if (!node || typeof node !== 'object') return
+      if (node.tag === 'button') buttons.push(node)
+      Object.values(node).forEach(walk)
+    }
+    walk(card)
+    assert.equal(buttons.length, items.length)
+    for (const button of buttons) {
+      const payload = button.behaviors[0].value
+      assert.equal(payload.k, 'session')
+      // `s` identifies the CONVERSATION (by the session it is on); `t` is the target.
+      assert.equal(payload.s, 'feishu-oc_a-mux2')
+      assert.ok(items.some((r) => r.sessionId === payload.t))
+    }
+    // The session in use is marked, and the running one is called out.
+    const labels = buttons.map((b) => b.text.content)
+    assert.equal(labels.filter((l) => l.includes('✓')).length, 1)
+    assert.ok(labels.some((l) => l.includes('▶')))
+    assert.ok(labels.every((l) => l.length <= 40), 'a label must fit a button')
+  })
+  await check('a settled picker shows the outcome and offers no more choices', () => {
+    const card = buildSessionsCard({
+      items: [sessionRows[0]], total: 1, currentId: sessionRows[0].sessionId,
+      sessionId: sessionRows[0].sessionId, locale: 'zh', settled: true,
+    })
+    assertValidCard(card, 'settled sessions card')
+    assert.equal((JSON.stringify(card).match(/"tag":"button"/g) ?? []).length, 0)
+    assert.match(JSON.stringify(card), /下一条消息将发往该会话/)
+  })
+  await check('an empty list still renders a valid card', () => {
+    const card = buildSessionsCard({ items: [], total: 0, currentId: 'x', sessionId: 'x', locale: 'zh' })
+    assertValidCard(card, 'empty sessions card')
+    assert.match(JSON.stringify(card), /没有可切换的会话/)
+  })
+
+  console.log('session switching')
+  const switchDir = await mkdtemp(join(tmpdir(), 'feishu-switch-'))
+  const switchLadder = new ConversationSessions({
+    sessionController: new FakeController(), cwd: '/tmp', stateDir: switchDir,
+  })
+  const switched = await switchLadder.use('oc_a', 'feishu-old-session')
+  await check('use() adopts an existing session instead of minting one', () => {
+    assert.equal(switched, 'feishu-old-session')
+    assert.equal(switchLadder.idFor('oc_a'), 'feishu-old-session')
+    // keyOf() reports ROUTING, which bind() establishes — use() only repoints the
+    // key. Asserting it here would be asserting the wrong contract.
+    assert.equal(switchLadder.keyOf('feishu-old-session'), undefined)
+    switchLadder.bind('oc_a', { chatId: 'oc_a', messageId: 'om_0' })
+    assert.equal(switchLadder.keyOf('feishu-old-session'), 'oc_a')
+  })
+  await check('use() persists, so a restart keeps the conversation where it was put', async () => {
+    const reloaded = new ConversationSessions({
+      sessionController: new FakeController(), cwd: '/tmp', stateDir: switchDir,
+    })
+    await reloaded.load()
+    assert.equal(reloaded.idFor('oc_a'), 'feishu-old-session')
+  })
+  await check('use() drops the routing of the session being left', async () => {
+    const inbound = { chatId: 'oc_a', messageId: 'om_1', senderId: 'u1', threadId: undefined }
+    switchLadder.bind('oc_a', inbound)
+    assert.equal(switchLadder.serves('feishu-old-session'), true)
+    const derived = sessionIdFor('oc_a')
+    switchLadder.bind('oc_a', inbound)
+    await switchLadder.use('oc_a', 'feishu-newer')
+    // The conversation answers from the new session only; the old pairing is gone.
+    assert.equal(switchLadder.serves('feishu-old-session'), false)
+    assert.equal(switchLadder.serves('feishu-newer'), false, 'routing is re-established by bind()')
+    assert.equal(switchLadder.keyOf('feishu-newer'), undefined)
+    assert.equal(derived === 'feishu-newer', false)
+  })
+  await check('use() with the same id is a no-op that keeps the binding', async () => {
+    const ladder2 = new ConversationSessions({ sessionController: new FakeController(), cwd: '/tmp' })
+    ladder2.bind('oc_b', { chatId: 'oc_b', messageId: 'om_2' })
+    const id = ladder2.idFor('oc_b')
+    await ladder2.use('oc_b', id)
+    assert.equal(ladder2.idFor('oc_b'), id)
+  })
+  await check('the switch action is handled before the pending lookup', async () => {
+    // Like the model buttons, it is stateless: no correlation entry exists, so the
+    // pending lookup would reject it as expired.
+    const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
+    const action = indexSource.indexOf("action.k === 'session'")
+    const lookup = indexSource.indexOf('const entry = pending.get(submitId ?? action.id)')
+    assert.ok(action > 0 && lookup > 0 && action < lookup, 'the stateless branch must come first')
+    // And it must verify the conversation is one this channel serves.
+    assert.match(indexSource.slice(action, action + 900), /sessions\.keyOf\(action\.s\)/)
   })
 
   console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)

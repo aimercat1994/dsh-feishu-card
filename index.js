@@ -31,6 +31,7 @@ import { Fanout } from './lib/fanout.js'
 import { installToolGuard } from './lib/guard.js'
 import { buildSendFileTool, resolveSendablePath } from './lib/outbound.js'
 import { DROP, admit, isPolicyDrop } from './lib/access.js'
+import { buildModelCard, describeSelection, modelStrings, resolveModelQuery } from './lib/model.js'
 import { applyPanelSync, desiredPanelEntries, planPanelSync } from './lib/command-panel.js'
 import { failureNote, promptContent, resolveImages } from './lib/images.js'
 import { describeCall, describeDiff, formatTokens } from './lib/present.js'
@@ -267,6 +268,39 @@ export async function apply(ctx, config = {}) {
           reply = {
             text: `\`${sessionId}\`\n卡片：${renderer.has(sessionId) ? t.statusBusy : t.statusIdle}`,
           }
+        } else if (name === 'model') {
+          const t = modelStrings(resolved.locale)
+          const catalog = await readModelCatalog()
+          if (!catalog) {
+            reply = { error: true, text: t.noController }
+          } else {
+            const query = text.replace(/^\/model\b/, '').trim()
+            const outcome = resolveModelQuery(query, catalog, resolved.locale)
+            if (outcome.list) {
+              // The picker IS the interface: Feishu has no autocomplete, so the
+              // models are buttons rather than something to type.
+              await transport.sendCardOnce(
+                buildModelCard({
+                  catalog,
+                  current: currentModelSelection(agent),
+                  sessionId,
+                  locale: resolved.locale,
+                }),
+                { chatId: inbound.chatId, replyToMessageId: inbound.messageId },
+              )
+              return
+            }
+            if (outcome.error) {
+              reply = { error: true, text: `${outcome.error}\n\n${t.usage}` }
+            } else {
+              const value = await ctx.get('sessionController').selectModel({
+                sessionId,
+                provider: outcome.entry.provider,
+                model: outcome.entry.model,
+              })
+              reply = { text: t.switched(describeSelection(value?.selected ?? outcome.entry)) }
+            }
+          }
         } else if (name === 'help') {
           reply = { text: await helpText({ commands: ctx.get('commands'), agent, locale: resolved.locale, logger }) }
         } else {
@@ -388,6 +422,36 @@ export async function apply(ctx, config = {}) {
       typeof name === 'string' && name.startsWith(CUSTOM_SUBMIT_PREFIX)
         ? name.slice(CUSTOM_SUBMIT_PREFIX.length)
         : undefined
+    // A model button is STATELESS: it carries the session it applies to, so it
+    // needs no correlation entry and stays live for as long as the card does. It
+    // is handled before the lookup below, which would otherwise reject it.
+    if (action.k === 'model') {
+      const t = modelStrings(resolved.locale)
+      const operatorId = operator?.openId ?? operator
+      if (resolved.approvers.length > 0 && (!operatorId || !resolved.approvers.includes(operatorId))) {
+        logger?.warn?.(`[feishu-card] refused a model click from a non-approver (${operatorId})`)
+        return { toast: { type: 'warning', content: '无权操作' } }
+      }
+      // The payload names a session, so it is only honoured for one this channel
+      // owns — a card from elsewhere must not steer an arbitrary session.
+      if (typeof action.s !== 'string' || !sessions.serves(action.s)) {
+        return { toast: { type: 'info', content: '该操作已失效' } }
+      }
+      const controller = ctx.get('sessionController')
+      if (!controller || typeof controller.selectModel !== 'function') {
+        return { toast: { type: 'warning', content: t.noController } }
+      }
+      try {
+        const value = await controller.selectModel({ sessionId: action.s, provider: action.p, model: action.m })
+        const label = describeSelection(value?.selected ?? { provider: action.p, model: action.m })
+        logger.info(`[feishu-card] model switched to ${label} for ${action.s}`)
+        return { toast: { type: 'success', content: t.toastSwitched(label) } }
+      } catch (error) {
+        logger.warn('[feishu-card] could not switch the model', error)
+        return { toast: { type: 'error', content: '切换失败，详见日志' } }
+      }
+    }
+
     const entry = pending.get(submitId ?? action.id)
     if (!entry) return { toast: { type: 'info', content: '该操作已失效' } }
 
@@ -719,6 +783,32 @@ export async function apply(ctx, config = {}) {
       panelSynced = false
       logger.warn('[feishu-card] could not sync the slash-command panel', error)
     }
+  }
+
+  /**
+   * The model this session is currently on, or `undefined` when it never chose one.
+   *
+   * Read from the session projection rather than cached: the Web UI can change the
+   * model too, and a cache would then disagree with the harness about what is
+   * running. `undefined` is meaningful — the session is on the deployment default.
+   */
+  const currentModelSelection = (agent) => {
+    const projections = ctx.get('sessionProjections')
+    const session = agent?.session
+    if (!projections || !session) return undefined
+    try {
+      return projections.stateOf(session, 'modelSelection')?.lastUsed ?? undefined
+    } catch (error) {
+      logger.warn('[feishu-card] could not read the model projection', error)
+      return undefined
+    }
+  }
+
+  /** The host's model catalogue, or `undefined` when this deployment has none. */
+  const readModelCatalog = async () => {
+    const controller = ctx.get('sessionController')
+    if (!controller || typeof controller.modelCatalog !== 'function') return undefined
+    return controller.modelCatalog()
   }
 
   ctx.on('agent/created', (payload) => {

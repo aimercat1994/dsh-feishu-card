@@ -453,6 +453,30 @@ v7 的其他接口都按资源名包一层，所以包 `slash_command` 是"合�
 
 断言 180 → 186。
 
+
+### `/model`：本会话的模型查看与切换
+
+宿主的命令注册表里**没有 `/model`**（同步后的面板里也没有），所以这个命令一直是"未知命令"。飞书没有自动补全，让用户手打模型名是很差的界面——所以 `/model` 给的是**可点卡片**，每个模型一个按钮，点了直接切换（按你确认的"直接执行"）。
+
+**接口**（都是宿主公开契约，不是猜的）：
+
+```js
+sessionController.modelCatalog()  → {default, groups:[{id,name,models:[{id,name,reasoning}]}], failures}
+sessionController.selectModel({sessionId, provider, model})  → {selected}
+ctx.sessionProjections.stateOf(agent.session, 'modelSelection')  → {lastUsed, next}
+```
+
+**几个刻意的取舍：**
+
+- **当前模型读投影，不缓存**：Web UI 也能改模型，缓存会和 harness 各说各话。`undefined` 是有意义的——表示本会话没选过，用部署默认。
+- **按钮载荷里带 `sessionId`**（`{k:'model', s, p, m}`），而不是从 chatId 反推：会话键取决于配置的 scope（chat / thread / sender），而点击事件**不带 thread**，反推在 `chat-thread` 模式下会算错。同时仍然校验 `sessions.serves(s)`——别的来源的卡片不能操纵任意会话。
+- **模型按钮是无状态的**：不需要 `pending` 条目，所以放在 pending 查找**之前**处理，否则会被"该操作已失效"挡掉；卡片因此长期有效。
+- **裸模型名只在无歧义时解析**：两个提供方都有 `flash` 时要求写 `provider/model`，而不是替用户猜一个。
+
+**顺带**：`callbackButton` / `choiceRows` 从 `card.js` 导出复用（不再抄一份）；新增 `duplicateElementIds()`——重复的 element_id 和非法的一样会被拒卡，此前只查了格式。
+
+断言 186 → 196。
+
 ---
 
 ## 未完成

@@ -24,12 +24,19 @@ import {
   buildTurnCard,
   buildDecisionCard,
   assertValidCard,
+  duplicateElementIds,
   invalidElementIds,
   settledDecisionElements,
 } from '../lib/card.js'
 import { TurnRenderer } from '../lib/turn.js'
 import { ConversationSessions, conversationKey, makeWorkspaceFiler, sessionIdFor } from '../lib/session.js'
-import { commandName, helpText, isCommandLine, runCommandLine } from '../lib/commands.js'
+import { commandName, helpText, isCommandLine, runCommandLine, strings } from '../lib/commands.js'
+import {
+  buildModelCard,
+  describeSelection,
+  flattenCatalog,
+  resolveModelQuery,
+} from '../lib/model.js'
 import { describeCall, describeDiff, formatTokens, kindOf } from '../lib/present.js'
 import { REACTION, ReactionTracker } from '../lib/react.js'
 import { FeishuTransport } from '../lib/feishu.js'
@@ -1841,6 +1848,118 @@ async function main() {
     assert.deepEqual(done, { created: 1, updated: 1, removed: 1, failed: 1 })
     assert.deepEqual(seen, ['del:bad', 'del:ok', 'upd:3', 'new:c'])
     assert.equal(warned.length, 1)
+  })
+
+  // `/model` is the channel's own command: the host has no `/model`, so without it
+  // the Feishu picker offered a name that answered "unknown command".
+  console.log('/model')
+  const catalog = {
+    default: { provider: 'deepseek', model: 'flash' },
+    routableProviders: ['deepseek', 'other'],
+    groups: [
+      { id: 'deepseek', name: 'DeepSeek', models: [
+        { id: 'flash', name: 'Flash', description: 'fast' },
+        { id: 'pro', name: 'Pro' },
+      ] },
+      { id: 'other', name: 'Other', models: [{ id: 'flash', name: 'Flash' }] },
+    ],
+    failures: [],
+  }
+
+  await check('/model is advertised by this channel and in the Feishu panel', () => {
+    assert.ok(OWN_PANEL_COMMANDS.some((c) => c.command === 'model'))
+    for (const locale of ['zh', 'en']) {
+      assert.ok(strings(locale).pluginCommands.some((line) => line.includes('/model')), `${locale} help must list /model`)
+    }
+  })
+  await check('a selection reads as provider/model, plus effort when set', () => {
+    assert.equal(describeSelection({ provider: 'p', model: 'm' }), 'p/m')
+    assert.equal(describeSelection({ provider: 'p', model: 'm', reasoningEffort: 'high' }), 'p/m (high)')
+    assert.equal(describeSelection(undefined), '')
+    assert.equal(describeSelection({ provider: '', model: '' }), '')
+  })
+  await check('the catalogue flattens with each model carrying its provider', () => {
+    const flat = flattenCatalog(catalog)
+    assert.equal(flat.length, 3)
+    assert.deepEqual(flat.map((e) => `${e.provider}/${e.model}`), ['deepseek/flash', 'deepseek/pro', 'other/flash'])
+    assert.equal(flat[0].providerName, 'DeepSeek')
+  })
+  await check('an exact provider/model resolves', () => {
+    const out = resolveModelQuery('deepseek/pro', catalog, 'zh')
+    assert.equal(out.entry.provider, 'deepseek')
+    assert.equal(out.entry.model, 'pro')
+  })
+  await check('a bare name resolves only when it is unambiguous', () => {
+    // Guessing between two providers' same-named models would silently pick one.
+    assert.equal(resolveModelQuery('pro', catalog, 'zh').entry.model, 'pro')
+    const ambiguous = resolveModelQuery('flash', catalog, 'zh')
+    assert.equal(ambiguous.entry, undefined)
+    assert.match(ambiguous.error, /deepseek\/flash/)
+    assert.match(ambiguous.error, /other\/flash/)
+  })
+  await check('matching is case-insensitive, and display names work', () => {
+    assert.equal(resolveModelQuery('DEEPSEEK/PRO', catalog, 'zh').entry.model, 'pro')
+    assert.equal(resolveModelQuery('Pro', catalog, 'zh').entry.entry?.model ?? resolveModelQuery('Pro', catalog, 'zh').entry.model, 'pro')
+  })
+  await check('an unknown name and an empty query are distinguished', () => {
+    assert.match(resolveModelQuery('nope', catalog, 'zh').error, /找不到模型/)
+    assert.match(resolveModelQuery('nope', catalog, 'en').error, /No model matches/)
+    assert.equal(resolveModelQuery('   ', catalog, 'zh').list, true)
+  })
+  await check('the picker card is valid and every model is a button', () => {
+    const card = buildModelCard({
+      catalog,
+      current: { provider: 'deepseek', model: 'flash' },
+      sessionId: 'feishu-abc',
+      locale: 'zh',
+    })
+    assertValidCard(card, 'model card')
+    assert.deepEqual(invalidElementIds(card), [])
+    // Duplicate element ids are their own card rejection.
+    assert.deepEqual(duplicateElementIds(card), [])
+    const buttons = []
+    const walk = (node) => {
+      if (Array.isArray(node)) return node.forEach(walk)
+      if (!node || typeof node !== 'object') return
+      if (node.tag === 'button') buttons.push(node)
+      Object.values(node).forEach(walk)
+    }
+    walk(card)
+    assert.equal(buttons.length, 3, 'one button per model')
+    const payloads = buttons.map((b) => b.behaviors[0].value)
+    for (const payload of payloads) {
+      assert.equal(payload.k, 'model')
+      // The session travels in the payload: the conversation key depends on the
+      // configured scope, and a click carries no thread to re-derive it from.
+      assert.equal(payload.s, 'feishu-abc')
+      assert.ok(payload.p && payload.m)
+    }
+    // The current model is marked, and only the current one.
+    const marked = buttons.filter((b) => b.text.content.startsWith('✓ '))
+    assert.equal(marked.length, 1)
+    assert.match(marked[0].text.content, /Flash/)
+  })
+  await check('a card with no current selection still builds, and an empty catalogue degrades', () => {
+    const bare = buildModelCard({ catalog, current: undefined, sessionId: 'feishu-abc', locale: 'zh' })
+    assertValidCard(bare, 'model card without a selection')
+    const empty = buildModelCard({
+      catalog: { default: { provider: 'p', model: 'm' }, groups: [], failures: [] },
+      current: undefined,
+      sessionId: 'feishu-abc',
+      locale: 'zh',
+    })
+    assertValidCard(empty, 'model card without models')
+    assert.match(JSON.stringify(empty), /没有可用模型/)
+  })
+  await check('provider failures are surfaced rather than hidden', () => {
+    const card = buildModelCard({
+      catalog: { ...catalog, failures: [{ id: 'broken', name: 'Broken', message: 'no credentials' }] },
+      current: undefined,
+      sessionId: 'feishu-abc',
+      locale: 'zh',
+    })
+    assertValidCard(card, 'model card with failures')
+    assert.match(JSON.stringify(card), /no credentials/)
   })
 
   console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)

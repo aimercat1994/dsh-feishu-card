@@ -528,6 +528,29 @@ ctx.sessionProjections.stateOf(agent.session, 'modelSelection')  → {lastUsed, 
 
 断言 201 → 214。
 
+
+### 修：绑定到外部会话后，会把别的前端的对话广播进群
+
+用户把飞书群切到了**当前这条 Web GUI 会话**。链路是通的（`onMessage` 的开卡日志证明飞书消息真的落进了这个会话），但暴露出一个新后果：
+
+```js
+// turn/start
+if (!renderer.has(sessionId)) {
+  const routing = sessions.routingFor(sessionId)
+  if (routing) void renderer.begin(sessionId, {...})   // 开卡
+}
+```
+
+它**不看回合是谁发起的**。以前无所谓——飞书会话的回合本来就都来自飞书；现在会话可以被绑到别处，于是**在 Web GUI 里说的话也会在群里开卡**。这是用户没要求、而且**看不见正在发生**的广播。
+
+改为**只渲染本渠道发起的回合**：`channelTurns` 记录每个会话还欠几条来自本群的消息，`onMessage` 派发 prompt 前 +1，`turn/end` −1，`turn/start` 仅在欠数 > 0 时开卡。
+
+**用计数而不是布尔标记**：回合进行中到达的消息是**排队**的，它欠一个自己的回合，而那个回合要等当前回合结束才开始。用"turn/end 清标记"的做法会把它丢掉。
+
+在派发**之前**计数，是因为 `turn/start` 可能在 `await prompt(...)` 还没 settle 时就到了——先派发后计数会漏掉那一轮。
+
+断言 214 → 215。
+
 ---
 
 ## 未完成

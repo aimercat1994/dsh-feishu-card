@@ -2190,6 +2190,17 @@ async function main() {
     await ladder2.use('oc_b', id)
     assert.equal(ladder2.idFor('oc_b'), id)
   })
+  await check('only turns this chat asked for are rendered into it', async () => {
+    // Binding a conversation to a session another frontend uses must not broadcast
+    // that frontend's conversations into a chat the user never pointed at it.
+    const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
+    assert.match(indexSource, /const channelTurns = new Map\(\)/)
+    // Counted, not flagged: a message admitted during a running turn is queued and
+    // owes a turn that starts only after the current one ends.
+    assert.match(indexSource, /channelTurns\.set\(sessionId, \(channelTurns\.get\(sessionId\) \?\? 0\) \+ 1\)/)
+    assert.match(indexSource, /if \(!renderer\.has\(sessionId\) && \(channelTurns\.get\(sessionId\) \?\? 0\) > 0\) \{/)
+    assert.match(indexSource, /const owed = channelTurns\.get\(sessionId\) \?\? 0/)
+  })
   await check('the switch action is handled before the pending lookup', async () => {
     // Like the model buttons, it is stateless: no correlation entry exists, so the
     // pending lookup would reject it as expired.

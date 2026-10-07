@@ -426,6 +426,9 @@ export async function apply(ctx, config = {}) {
         })
         return
       }
+      // Counted BEFORE the dispatch: `turn/start` can arrive while this await is
+      // still settling, and an un-counted turn would then render nothing.
+      channelTurns.set(sessionId, (channelTurns.get(sessionId) ?? 0) + 1)
       await ctx.sessionController.prompt(
         {
           requestId: nextId(),
@@ -910,6 +913,20 @@ export async function apply(ctx, config = {}) {
     return card
   }
 
+  /**
+   * How many turns each session still owes to a message that arrived HERE.
+   *
+   * A chat should show what was said in the chat. Once a conversation can be bound
+   * to a session another frontend also uses (see `/sessions`), "render every turn in
+   * a served session" starts broadcasting Web-GUI conversations into a group chat —
+   * a surprise the user never asked for, and one they cannot see is happening.
+   *
+   * Counted rather than flagged because a message admitted during a running turn is
+   * queued: it owes a turn of its own, and that turn starts only after the current
+   * one ends. A flag cleared at `turn/end` would lose it.
+   */
+  const channelTurns = new Map()
+
   /** Every visible session row, newest first (the host orders them by activity). */
   const listSessions = async () => {
     const controller = ctx.get('sessionController')
@@ -972,7 +989,7 @@ export async function apply(ctx, config = {}) {
         renderer.setStatus(sessionId, { title: 'DSH · 思考中', template: TEMPLATE.running })
         renderer.setSubtitle(sessionId, '')
         renderer.resetLive(sessionId)
-        if (!renderer.has(sessionId)) {
+        if (!renderer.has(sessionId) && (channelTurns.get(sessionId) ?? 0) > 0) {
           const routing = sessions.routingFor(sessionId)
           if (routing) {
             void renderer
@@ -1056,6 +1073,11 @@ export async function apply(ctx, config = {}) {
       }
 
       case 'turn/end': {
+        // This turn's debt to a message from this chat is settled, whatever its
+        // outcome: a turn ends exactly once, including when it fails or is aborted.
+        const owed = channelTurns.get(sessionId) ?? 0
+        if (owed <= 1) channelTurns.delete(sessionId)
+        else channelTurns.set(sessionId, owed - 1)
         const kind = data?.reason?.kind
         const failed = kind === 'error' || kind === 'aborted' || kind === 'interrupted'
         const state = renderer.get(sessionId)

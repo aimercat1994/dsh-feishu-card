@@ -608,6 +608,8 @@ catalog 里本来就有 `reasoning: {efforts:[{id,name,description?}], defaultEf
 断言 220。
 
 
+## 0.3.1
+
 ### `/preset` 与 `/permission`：模式与权限选择
 
 两者形状相同（会话级、从固定集合里选一个），所以共用一个卡片构造、一个 select 元素、一套载荷约定（意图放在 option value 的 `{v}` 里，behavior 只做常量标记）。

@@ -1951,6 +1951,30 @@ async function main() {
     assertValidCard(empty, 'model card without models')
     assert.match(JSON.stringify(empty), /没有可用模型/)
   })
+  await check('the check mark ignores the reasoning effort', () => {
+    // A button stands for a model, not for one effort level. Comparing the rendered
+    // label (which appends " (high)") against a bare model would drop the mark
+    // exactly when the session is most specifically configured.
+    const card = buildModelCard({
+      catalog,
+      current: { provider: 'deepseek', model: 'pro', reasoningEffort: 'high' },
+      sessionId: 'feishu-abc',
+      locale: 'zh',
+    })
+    const buttons = []
+    const walk = (node) => {
+      if (Array.isArray(node)) return node.forEach(walk)
+      if (!node || typeof node !== 'object') return
+      if (node.tag === 'button') buttons.push(node)
+      Object.values(node).forEach(walk)
+    }
+    walk(card)
+    const marked = buttons.filter((b) => b.text.content.startsWith('✓ '))
+    assert.equal(marked.length, 1, 'exactly one mark even with an effort set')
+    assert.match(marked[0].text.content, /Pro/)
+    // The effort still shows in the current-model line.
+    assert.match(JSON.stringify(card), /deepseek\/pro \(high\)/)
+  })
   await check('a switch repaints the picker by BOTH routes', async () => {
     // A toast alone leaves the card claiming the previous model, which reads as
     // "the click did nothing" — the exact complaint this fixes. Neither route is

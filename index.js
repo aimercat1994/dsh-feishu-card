@@ -354,7 +354,7 @@ export async function apply(ctx, config = {}) {
           reply = { error: true, text: `${outcome.error ?? t.usage}` }
         } else {
           const target = outcome.item.sessionId
-          const result = await switchConversation(key, target, inbound)
+          const result = await switchConversation(key, target, { chatId, messageId: replyToMessageId })
           const label = `${sessionLabel(outcome.item)} · \`${target}\``
           reply = { text: result.unchanged ? t.already(label) : t.switched(label) }
         }
@@ -434,6 +434,14 @@ export async function apply(ctx, config = {}) {
           logger,
           signal: lifetime.signal,
         })
+      }
+      if (reply === undefined) {
+        // A branch that neither answered nor returned. This used to throw at the
+        // send below, so the user saw nothing at all and the log said only
+        // "cannot read properties of undefined" — no command name. Naming it turns
+        // "the button did nothing" into a one-line diagnosis.
+        logger.error(`[feishu-card] /${name} produced no reply`)
+        reply = { error: true, text: `⚠️ \`/${name}\` 没有产生回复（内部错误，详见日志）` }
       }
       await transport.sendCardOnce(
         buildNoticeCard({
@@ -637,12 +645,23 @@ export async function apply(ctx, config = {}) {
       // Only commands the card actually offered, and only for a live conversation:
       // the payload is a name, so anything that trusted it blindly could run an
       // arbitrary line.
+      const agent = await agentFor(action.s)
+      if (!agent) return { toast: { type: 'warning', content: '当前部署未提供该接口' } }
+      // The card offers the channel's commands AND the host registry's, so the
+      // allow-list has to cover both — checking only the former silently refused
+      // every host button.
       const offered = ownCommands(resolved.locale).some((entry) => entry.name === command)
+        || (() => {
+          try {
+            return [...(ctx.get('commands')?.list?.(agent) ?? [])].some((entry) => entry.name === command)
+          } catch (error) {
+            logger.warn('[feishu-card] could not verify the tapped command', error)
+            return false
+          }
+        })()
       if (!offered || key === undefined) {
         return { toast: { type: 'info', content: '该操作已失效' } }
       }
-      const agent = await agentFor(action.s)
-      if (!agent) return { toast: { type: 'warning', content: '当前部署未提供该接口' } }
       const routing = sessions.routingFor(action.s) ?? { chatId, messageId }
       await runCommand({
         name: command,

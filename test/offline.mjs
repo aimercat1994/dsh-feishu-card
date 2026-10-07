@@ -2515,6 +2515,40 @@ async function main() {
     assertValidCard(card, 'empty help card')
     assert.match(JSON.stringify(card), /没有可用的命令/)
   })
+  await check('runCommand has no reference to the caller it was extracted from', async () => {
+    // The extraction replaced `inbound.chatId`/`inbound.messageId` but missed a bare
+    // `inbound`, which threw at runtime — the click did nothing and the log named no
+    // command. This pins the whole class.
+    const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
+    const start = indexSource.indexOf('const runCommand = async')
+    const end = indexSource.indexOf('async function onMessage')
+    assert.ok(start > 0 && end > start)
+    const body = indexSource.slice(start, end)
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+    assert.doesNotMatch(body, /\binbound\b/, 'runCommand must take everything it needs as parameters')
+  })
+  await check('a command that answers nothing says so instead of throwing', async () => {
+    // The send below reads `reply.error`; an unassigned branch used to throw there,
+    // so the user saw nothing and the log named no command.
+    const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
+    const guard = indexSource.indexOf('produced no reply')
+    const send = indexSource.indexOf('template: reply.error')
+    assert.ok(guard > 0 && send > guard, 'the guard must precede the send')
+    const window = indexSource.slice(guard - 600, guard + 200)
+    assert.match(window, /reply === undefined/)
+    // And it names the command, which is the whole point.
+    assert.match(window, /\$\{name\}/)
+  })
+  await check('a help button may run a host command too', async () => {
+    // The card offers both sections, so an allow-list covering only the channel's own
+    // commands silently refused every host button.
+    const indexSource = await readFile(new URL('index.js', repoRoot), 'utf8')
+    const action = indexSource.slice(indexSource.indexOf("action.k === 'run'"))
+    const body = action.slice(0, action.indexOf("action.k === 'preset'"))
+    assert.match(body, /ownCommands\(resolved\.locale\)\.some/)
+    assert.match(body, /ctx\.get\('commands'\)\?\.list\?\.\(agent\)/)
+  })
   await check('a help button runs through the SAME dispatcher as a typed command', async () => {
     // A command that works when typed but fails when tapped is reported as "the
     // button does nothing", so there is exactly one implementation.

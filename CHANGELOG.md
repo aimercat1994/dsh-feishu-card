@@ -677,6 +677,35 @@ await applyPendingPreset(key, agent)   // 下一条消息 reach 之后、首次 
 
 断言 231 → 236。
 
+
+### 修：帮助卡片的按钮点了没反应（三处）
+
+用户反馈"点了没反应"。日志给了行号：
+
+```
+ERROR card action handler failed Cannot read properties of undefined (reading 'error')
+    at runCommand (index.js:441:27)
+```
+
+**① 抽函数时漏了一个裸引用。** 把命令分支抽成 `runCommand` 时我替换了 `inbound.chatId` / `inbound.messageId`，但 `/switch` 分支里还有一处 **`switchConversation(key, target, inbound)`**——`inbound` 已经不是参数了。**改了同名成员、漏了裸变量**，是这种机械替换最典型的失误。
+
+**② 按钮的许可检查只覆盖本渠道命令。** 帮助卡片同时列出宿主命令（`/export`、`/feedback`…），而 `offered` 只查 `ownCommands`——于是**每一个宿主按钮都被静默拒绝**。
+
+**③ 最要紧的是：`reply` 未赋值那条路径没有任何提示。** 它一路走到 `reply.error` 才抛，用户看到的是"什么都没发生"，日志里也只有一句 `cannot read properties of undefined`——**没有命令名**。现在加了一道守卫：
+
+```js
+if (reply === undefined) {
+  logger.error(`[feishu-card] /${name} produced no reply`)   // ← 命名命令
+  reply = { error: true, text: `⚠️ \`/${name}\` 没有产生回复（内部错误，详见日志）` }
+}
+```
+
+**一个静默失败比一个失败的失败贵得多**：前两个 bug 都是"某条路径没走到"，而第三个让它们变得不可诊断。守卫本身也带断言（必须位于 send 之前、且必须打印命令名）。
+
+新增 3 条断言，其中一条是**源码级的抽取不变量**：`runCommand` 函数体内不得出现裸 `inbound`。
+
+断言 236 → 239。
+
 ---
 
 ## 未完成

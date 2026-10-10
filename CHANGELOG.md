@@ -800,6 +800,48 @@ if (reply === undefined) {
 
 ---
 
+## 0.3.4
+
+### 修：三处"卡片上读不出发生了什么"的呈现问题
+
+用户在飞书里截了三张图，说的是同一件事：**卡片把动作记下来了，但读不出动作的内容。**
+
+**① `fetch` / `compress` / `skill` 只剩一个工具名。** `present.js` 的 `targetOf()` 只从 `path` / `file_path` / `target` / `pattern` / `query` / `command` 这一小串键里找"这一笔在做什么"，而 `web_fetch` 传的是 `{url}`、`skill` 传的是 `{name}`——两者都落在表外，于是行里只剩图标和名字。`compress` 更彻底：它没有任何路径或命令，`kindOf('compress')` 把它归到 `other`，行里**只有** `🔧 \`compress\``。
+
+修：`targetOf` 的键表补上 `url` 与 `name`；`compress` 单独走一条分支 `compressedRanges()`，把这次压缩**压了哪几段**读出来——`content` 是结构化数组时取每段的 `topic`，是纯文本时按 `/^m\d{5}/` 挑出行首，`startId`/`endId` 落在顶层时也能读——渲染成 `🗜️ \`compress\` 4 段 · m00001–m00004 会话背景`。图标表补 `compress: '🗜️'`、`skill: '🧠'`。
+
+**② 后台任务完成把整条脚本倒进活动行。** `jobLine()` 原来直接用 `job.label`，而 `label` 是**整条 shell 命令**（可以多行，几百字符），于是过程面板里出现一条又长又断行的"后台任务完成"。修：`jobLabel()` 把换行/制表/连续空白压成单个空格、裁到 59 字符加省略号，`jobLine()` 在前面补上任务 id（`bash-119 · …`，且 label 自己已经以 id 开头时不重复补）。一行 ≤80 字符。
+
+**③ 思考过程和工具调用糊在一起，多段思考也分不开。** `processPanel()` 把 `reasoning` 元素和 `activity` 元素直接相邻堆放，中间没有任何东西；而 `turn.js` 把每一步的思考都**拼进同一个 `committedReasoning` 字符串**——一个回合里有几段思考，读起来就是连续的一大段。
+
+修：分两层。面板里在 reasoning 与 activity 之间放一个 `hr`（`ELEMENTS.processSep = 'process_sep'`）——**是一个恒存在的元素**，插入是流式期间最不能做的事（节点位置一变，客户端布局就跳）。行内加两个小标题：每段思考前带 `**思考1**`、`**思考2**`（`numberedReasoning()`：空段跳过、编号连续，**进行中的那段也带编号**，所以它落定时编号不会变），工具时间线整体加 `**工具调用**` 前缀（`activityBlock()`）。状态从 `committedReasoning` 字符串改成 `reasoningSegments` 数组，`get reasoning()` 再拼回来，所以 `document()` 和 `#elementContent` 两条渲染路径拿到的都是同一份带编号文本；`activityBlock()` 在**两处都套**，避免面板在"流式中"和"终态"之间来回换标题。
+
+**断言 259 → 266**（+7）。新断言覆盖：三种调用的行内容（含 `compress` 的两种 range 形状与无 range 的退化）、`jobLine` 把 400+ 字符的多行 label 压成单行 ≤80 字符且前缀 id、以及"流式元素里就有 `思考1`/`思考2` 与 `工具调用` 标题、终态卡片里 `reasoning / process_sep / activity` 三元素按序相邻"。全部先在**未修复的代码上跑过**：把 `lib/` 的四文件改动整体撤掉后，这 7 条全红、其余 259 条不受影响；`git apply` 回补后全绿。
+
+**④ 子代理（delegation）在卡片上几乎没有痕迹。** 一个子代理的**会话**不属于这个插件绑定的飞书聊天，它的 `subagent/descriptor` 写在子会话里、被 `serves()` 挡在门外；工作流的 `tool-workflow/*` 扇出行虽然写在父会话、能显示，但只活在当回合的过程面板里，回合结束面板一折就埋了。`subagent` 工具行本身也只剩工具名——`targetOf()` 的键表里没有它的 `description`。
+
+修：`present.js` 给 `subagent` 单独一条分支，`description`（工具 schema 自称的展示字段）→ `label` → `prompt` 依次取第一个非空者、裁剪 60 字符，于是行变成 `🧑‍💻 \`subagent\` 重构卡片流式更新`。再加一张**常驻的「子代理」卡**（`lib/subagents.js` + `progress.js` 的 `subagentCard`）：每个聊天一张、原位更新，标题 `🤖 子代理 2/3`，每行 `⏳/✅/❌ **任务** · 进行中/完成/失败`，全部落定才转绿、有失败转红；默认开，设置页可关。
+
+数据源不走 host 的 `subagent/start|end`：它们的载荷里**没有委派它的那个会话 id**，卡片无从知道该更新哪个聊天。改走**被服务会话自己的 `tool/call` 与 `tool/result`**——调用参数里有 `description`，结果里带着同一个 `callId`，所以并发跑几个子代理也各归各位。后台/可续跑的子代理是**立刻**返回 `started …`（子代理还在跑），这类结果**不**判完成，只标 `后台运行中`：否则卡片会撒一个自己永远纠正不了的谎。
+
+**断言 266 → 276**（+10）。新断言覆盖：`subagent` 调用行的内容（含只给 prompt、参数不是 JSON 的退化）、子代理卡的计数与三种行标记、三种表头色、宽扇出裁剪（8 行 + `…还有 N 个`）、roster 按 `callId` 精确结算（并发两条互不影响、未知 callId 不动状态）、`started …` 不判完成、失败判失败、`/new` 清空 roster、roster 卡只创建一次并原位更新，以及"宿主把 roster 同时接到 call 与 result"的源码断言。
+
+**⑤ 后台子代理跑完了，名册还停在「进行中」。** 这是 ④ 里"不撒谎"的代价被实测出来的一次：真实卡片在后台委派后停在 `1/2`，子代理 20 秒后就结束了，那一行却永远显示 `⏳ 后台运行中`。原因是插件手上确实没有"子代理结束了"的信号——host 的 `subagent/end` 载荷里不带委派它的会话，子会话自己的事件又被 `serves()` 挡在门外。
+
+修：接上**两条本来就写在这个会话里、只是没人接的账**。① `subagent/catalog`：父会话自己持有的持久事实，形如 `{version, childId, childCreatedAt, mode, label}`，是这里唯一**按 id 点名子代理**的事件（`@deepseek-ai/dsh-subagent` 的 `establishCatalogChild()` 把 `one-shot` 与 `continuable` 都写进父会话）；② 子代理结束时平台发给父会话的那条通知，它的 `source` 是 `{kind:'subagent-settled', summary, senderSessionId}`，而 `senderSessionId` 就是 `childId`。于是三层接起来：`tool/result` 的 `started subagent <id>` 先把 id 记到那一行（结果带着 `callId`，并发几个也不串），`subagent/catalog` 作为兜底按 label 认领还没主的等待行，`subagent-settled` 到达时结算该 id 的那一行。
+
+结算不搞一刀切成功：平台自己的结尾句式里**只有一句是成功**（`finished and will do no further work`），其余 `was stopped before it finished` / `ran out of room before it finished` / `declined the task` / `failed before it finished` / `ended abnormally` 各自判失败并显示短原因（已中止 / 超出长度 / 拒绝执行 / 执行失败 / 异常结束）；**认不出的结尾也判失败**——不能因为读不懂就报成功。
+
+**断言 276 → 282**（+6）。新断言覆盖：从 `started …` 里取 id、`subagent-settled` 只结算等待该 childId 的那一行（同一通知重复到达不算重写、未知 childId 不动状态）、六种结尾各自的判词、`subagent/catalog` 按 label 认领（label 对不上则认领最新的等待行）、已结算的行不会再被认领，以及"宿主把 `subagent/catalog` 与 `subagent-settled` 接到 roster"的源码断言。也先在**未接线**的代码上跑过：把 `index.js` 的整体改动撤掉后，2 条接线断言全红、其余 280 条不受影响；回补后 282 全绿。
+
+**⑥ 同一张名册卡在同一秒被建了两次。** 这是 ⑤ 的实测量顺手暴露的：一次后台委派之后，聊天里出现了**两张一模一样的 `🤖 子代理 0/1`**，其中一张永远停在第一帧。会话日志把时间线摊得很清楚——`tool/call`（建卡）、`subagent/catalog`、以及 **48 毫秒后**的 `tool/result`（内容是 `started subagent <id>`，按 ④ 的规矩这一行要改写成"后台运行中"）——于是"建卡"和"改写"两次写入几乎同时出发。建卡是一次网络往返，第二次写入在它返回之前就查 `#cards`，当然查不到 id，于是又建了一张。这不是名册特有的毛病：任何"先建后改"的进度卡都有同一个窗口。
+
+修：`ProgressCards` 给**每张卡一条写入链**（`${sessionId}\0${kind}` → 链尾 Promise），同一张卡的写入按到达顺序排队；建卡只会发生在队列的第一个写入里，后面排队的快照落地成对这张新卡的 `updateCard`。`forget()` / `dispose()` 一并清掉链尾。
+
+**断言 282 → 283**（+1）。新断言用一个"建卡要 5 毫秒"的假 transport，同时发出两份名册快照，断言 `created === 1`、`sent === 1`、`updates === 1`，并且只影响 `subagent` 这一种卡；把这条链去掉，正好这一条红、其余 282 条不受影响。
+
+---
+
 ## 未完成
 
 - `send_file` 拒绝路径的真实触发（实测时 agent 走了"复制进工作区再发"的路线）
@@ -807,3 +849,9 @@ if (reply === undefined) {
 - `output: cot`（飞书原生思考消息）模式
 - 多问题合并表单
 - 契约断言目前只覆盖 transport 一层；其他协作对象（renderer 等）的假对象仍可能掩盖同类问题
+- 0.3.4 的三处渲染修正在离线断言与一个 `/tmp` 渲染脚本里验证过，**尚未在真实飞书卡片上再看一眼**（`node test/offline.mjs` 全绿只说明卡片 JSON 的形状对）
+- 0.3.4 的子代理名册卡已在真实 API 上建过、也被一次真实的委派驱动过（前台委派后标题 `🤖 子代理 1/1`、同一条消息原位更新，create/update 相隔 6.2 秒），但**卡片的行文本读不出来**——v2 卡片的消息正文只返回"请升级至最新版本客户端"，所以每行的标记只有离线断言 + 肉眼确认
+- ⑤ 的"后台子代理跑完后自动收成完成"已在**真实卡片上实测通过**：`🤖 子代理 0/1` 建于 17:14:00，同一张卡在 17:14:51 变成 `1/1`，`subagent/catalog`（点名 childId）与 `subagent-settled`（结算通知）也都在会话日志里对上了
+- ⑥ 的修复**已实测**：重启后再委派一个后台子代理，聊天里只建出**一张**名册卡（`🤖 子代理 0/1` 建于 19:26:28，`started …` 的改写落在 19:26:29 的同一张卡上，结算通知到后 19:26:46 变成 `1/1`），没有双胞胎
+- ⑤⑥ 都验完了，但"真实卡片上的行文本"依然读不出来（v2 卡片正文只返回"请升级至最新版本客户端"），所以每行的标记仍只有离线断言 + 肉眼确认
+- 实测 ⑤ 时留下的那张"双胞胎"卡（`om_x100b6394534ca4acc2e248b3ea9fa62`）仍停在 `0/1`，需要人工删除——插件没有删除聊天消息的接口

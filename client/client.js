@@ -136,6 +136,12 @@ window.__ModuleLoader__.load({
         fields: [
           { name: 'showProcess', label: '显示过程面板', kind: 'boolean' },
           {
+            name: 'subagentCard',
+            label: '子代理卡片',
+            kind: 'boolean',
+            hint: '每个聊天单独一张常驻卡片，逐行显示委派的子代理及其进行/完成/失败状态。',
+          },
+          {
             name: 'readingPreset',
             label: '版式预设',
             kind: 'select',

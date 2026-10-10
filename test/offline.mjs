@@ -60,7 +60,8 @@ import { describeCall, describeDiff, formatTokens, kindOf } from '../lib/present
 import { REACTION, ReactionTracker } from '../lib/react.js'
 import { FeishuTransport, STREAM_CLOSED_CODES, isStreamingClosed } from '../lib/feishu.js'
 import { Notices, compactionFailedLine, jobLine, pressureLine, retryLine } from '../lib/notice.js'
-import { PROGRESS_ELEMENTS, ProgressCards, goalCard, todoCard } from '../lib/progress.js'
+import { PROGRESS_ELEMENTS, ProgressCards, goalCard, subagentCard, todoCard } from '../lib/progress.js'
+import { SubagentRoster, childIdIn, settlementOutcome } from '../lib/subagents.js'
 import {
   Config,
   SETTINGS_NAMESPACE,
@@ -422,6 +423,39 @@ async function main() {
     assert.equal(transport.updates[0].card.config.streaming_mode, false)
     assert.deepEqual(transport.released, ['card_1'])
     assert.equal(renderer.has('s1'), false)
+  })
+
+  console.log('numbered thinking and a separated tool timeline')
+  const tSep = new FakeTransport()
+  const rSep = new TurnRenderer({ transport: tSep, flushIntervalMs: 5, preset: 'detailed' })
+  await rSep.begin('s3', { chatId: 'c3' })
+  rSep.addLiveReasoning('s3', '第一段想法')
+  await settle()
+  rSep.commitAssistant('s3', { text: '', reasoning: '第一段想法' })
+  rSep.addActivity('s3', '⚡ `execute` ls')
+  rSep.addLiveReasoning('s3', '第二段想法')
+  await settle()
+  await check('every thought keeps its own number while streaming', () => {
+    const shown = tSep.lastStream(ELEMENTS.reasoning)
+    assert.match(shown, /\*\*思考1\*\*/)
+    assert.match(shown, /\*\*思考2\*\*/)
+    assert.match(shown, /第一段想法/)
+    assert.match(shown, /第二段想法/)
+  })
+  await check('the tool timeline is headed while streaming', () => {
+    assert.match(tSep.lastStream(ELEMENTS.activity), /^\*\*工具调用\*\*/)
+  })
+  await rSep.finish('s3', {})
+  await check('the settled card separates each thought from the tool timeline', () => {
+    const panel = tSep.updates[0].card.body.elements.find((e) => e.element_id === ELEMENTS.process)
+    assert.deepEqual(
+      panel.elements.map((e) => e.element_id),
+      [ELEMENTS.reasoning, ELEMENTS.processSep, ELEMENTS.activity],
+    )
+    assert.equal(panel.elements[1].tag, 'hr')
+    assert.match(panel.elements[0].content, /\*\*思考1\*\*\n第一段想法/)
+    assert.match(panel.elements[0].content, /\*\*思考2\*\*\n第二段想法/)
+    assert.match(panel.elements[2].content, /^\*\*工具调用\*\*/)
   })
 
   console.log('reasoning tail')
@@ -876,6 +910,53 @@ async function main() {
     assert.equal(formatTokens(45678), '46k')
     assert.equal(formatTokens(0), undefined)
   })
+  await check('fetch, compress and skill calls carry their own content', () => {
+    // What made these three unreadable: the target fell outside the keys
+    // `targetOf` looked at, and a compress call has no path or command at all.
+    assert.match(
+      describeCall('web_fetch', JSON.stringify({ url: 'https://example.com/a' })),
+      /https:\/\/example\.com\/a/,
+    )
+    const compressed = describeCall('compress', JSON.stringify({
+      content: [
+        { startId: 'm00001', endId: 'm00004', topic: 'session context' },
+        { startId: 'm00500', endId: 'm00510', topic: 'recon' },
+      ],
+    }))
+    assert.match(compressed, /🗜️/)
+    assert.match(compressed, /2 段/)
+    assert.ok(compressed.includes('m00001'))
+    assert.ok(compressed.includes('m00004'))
+    assert.ok(compressed.includes('session context'))
+    assert.match(describeCall('skill', JSON.stringify({ name: 'find-dsh-plugins' })), /find-dsh-plugins/)
+  })
+  await check('a compress call survives either shape of ranges', () => {
+    // The harness sends the ranges either as structured content or as the
+    // literal summary text; both are read.
+    assert.match(
+      describeCall('compress', JSON.stringify({ content: 'm00001–m00004 first\nprose\nm00009 lone' })),
+      /2 段/,
+    )
+    const head = describeCall('compress', JSON.stringify({ startId: 'm00010', endId: 'm00020' }))
+    assert.match(head, /1 段/)
+    assert.ok(head.includes('m00010'))
+    assert.ok(head.includes('m00020'))
+    const empty = describeCall('compress', JSON.stringify({ note: 'nothing to report' }))
+    assert.match(empty, /compress/)
+    assert.ok(!empty.includes('段'), empty)
+  })
+  await check('a subagent call names the task it delegates', () => {
+    // The tool's own schema calls `description` its display field; the tool name
+    // alone said nothing about who was running what.
+    assert.match(
+      describeCall('subagent', JSON.stringify({ description: '前端重构', prompt: '很长很长的提示词' })),
+      /🧑‍💻 `subagent` 前端重构/,
+    )
+    assert.match(describeCall('subagent', JSON.stringify({ prompt: '只给了提示词' })), /只给了提示词/)
+    const bare = describeCall('subagent', '{not json')
+    assert.match(bare, /`subagent`/)
+    assert.ok(!bare.includes('not json'), bare)
+  })
 
   console.log('hideProcessWhenDone folds the panel at the end')
   const t4 = new FakeTransport()
@@ -1076,6 +1157,22 @@ async function main() {
     assert.match(jobLine({ status: 'failed', label: 'test' }), /❌.*test/)
     assert.match(jobLine({ status: 'killed', label: 'x' }), /⛔/)
   })
+  await check('a job whose label is a whole script reads as one bounded line', () => {
+    // A job label is the shell command itself, so the settlement notice used to
+    // dump an entire multi-line script into the process panel.
+    const script = 'cd /tmp; echo "=== POSIX branch of findChromeBinary ===";\n'
+      + "sed -n '258,300p' ego-index.ts; echo \"=== chromePath references ===\";\n"
+      + 'grep -n "chromePath" ego-index.ts | head -20'
+    const line = jobLine({ id: 'bash-119', status: 'completed', label: script })
+    assert.match(line, /^✅ 后台任务完成：bash-119 · /)
+    assert.ok(!line.includes('\n'), line)
+    assert.ok(line.length <= 80, `${line.length} chars: ${line}`)
+    assert.ok(line.endsWith('…'), line)
+  })
+  await check('a job label that already names its id is not prefixed twice', () => {
+    assert.equal(jobLine({ id: 'bash-7', status: 'failed', label: 'bash-7 sleep 3' }), '❌ 后台任务失败：bash-7 sleep 3')
+    assert.match(jobLine({ id: 'bash-8', status: 'killed' }), /^⛔ 后台任务已终止：bash-8 · /)
+  })
 
   console.log('notice delivery')
   /** A stand-in for the pieces Notices talks to. */
@@ -1164,7 +1261,7 @@ async function main() {
     assert.deepEqual(value, { k: 'goal', id: 'g1', revision: 7, op: 'pause' })
   })
   await check('progress cards use schema-2.0 shapes only', () => {
-    for (const card of [todoCard([]), goalCard({ id: 'g', revision: 1, objective: 'o', phase: 'active' })]) {
+    for (const card of [todoCard([]), goalCard({ id: 'g', revision: 1, objective: 'o', phase: 'active' }), subagentCard([])]) {
       assert.ok(!allTags(card).includes('action'))
       assert.deepEqual(invalidElementIds(card), [])
     }
@@ -1199,6 +1296,158 @@ async function main() {
     pt.updateCard = ProgressTransport.prototype.updateCard ?? (async () => { pt.updates++ })
     await pc.showTodos('s', [{ content: 'c', status: 'pending' }])
     assert.equal(pt.created, 2, 'a fresh card replaces the expired one')
+  })
+  await check('a subagent roster creates one card and updates it in place', async () => {
+    const before = pt.created
+    await pc.showSubagents('s', [{ label: '重构', state: 'running' }])
+    await pc.showSubagents('s', [{ label: '重构', state: 'completed' }])
+    assert.equal(pt.created, before + 1, 'one roster card per conversation')
+    assert.equal(pc.cardId('s', 'subagent'), `pc${pt.created}`, 'later snapshots reuse it')
+  })
+
+  await check('a snapshot arriving inside the create round trip reuses the card', async () => {
+    // The real shape of this bug, seen on the Feishu API: `tool/call` creates the
+    // roster card and the `started …` result rewrites it ~50 ms later, so the
+    // second snapshot ran while the create was still in flight, found no id, and
+    // made a twin card that then froze on the first snapshot.
+    const slow = new ProgressTransport()
+    slow.createCard = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      slow.created += 1
+      return `sl${slow.created}`
+    }
+    const race = new ProgressCards({ transport: slow, sessions: sessionsFor })
+    await Promise.all([
+      race.showSubagents('s3', [{ label: '重构', state: 'running' }]),
+      race.showSubagents('s3', [{ label: '重构', state: 'running', note: '后台运行中' }]),
+    ])
+    assert.equal(slow.created, 1, 'one card, even when the second snapshot beats the create')
+    assert.equal(slow.sent, 1, 'sent once')
+    assert.equal(slow.updates, 1, 'the second snapshot lands as an update on the card just created')
+    assert.equal(race.cardId('s3', 'subagent'), 'sl1')
+    assert.equal(race.cardId('s3', 'todo'), undefined, 'and the other kinds stay untouched')
+  })
+
+  console.log('subagent roster')
+  await check('a subagent card counts what settled and marks each row', () => {
+    const card = subagentCard([
+      { label: '前端重构', state: 'running' },
+      { label: '改后端', state: 'completed' },
+      { label: '写文档', state: 'failed' },
+    ])
+    assert.match(card.header.title.content, /🤖 子代理 2\/3/)
+    const body = card.body.elements[0].content
+    assert.match(body, /⏳ \*\*前端重构\*\* · 进行中/)
+    assert.match(body, /✅ \*\*改后端\*\* · 完成/)
+    assert.match(body, /❌ \*\*写文档\*\* · 失败/)
+  })
+  await check('a roster is not coloured as finished while a child still runs', () => {
+    assert.equal(subagentCard([{ label: 'a', state: 'running' }]).header.template, 'blue')
+    assert.equal(subagentCard([{ label: 'a', state: 'completed' }]).header.template, 'green')
+    assert.equal(subagentCard([
+      { label: 'a', state: 'completed' },
+      { label: 'b', state: 'failed' },
+    ]).header.template, 'red', 'a failure must keep the header honest')
+  })
+  await check('a wide fan-out is bounded', () => {
+    const card = subagentCard(Array.from({ length: 20 }, (_, i) => ({ label: `c${i}`, state: 'running' })))
+    assert.match(card.body.elements[0].content, /还有 12 个/)
+  })
+  await check('the roster settles exactly the call its result answers', () => {
+    const roster = new SubagentRoster()
+    assert.equal(roster.note('s', 'call-1', 'subagent', JSON.stringify({ description: '前端重构' })), true)
+    roster.note('s', 'call-2', 'subagent', JSON.stringify({ description: '改后端' }))
+    assert.equal(roster.note('s', 'call-3', 'bash', '{}'), false, 'a non-subagent call is not tracked')
+    assert.deepEqual(roster.list('s').map((r) => r.state), ['running', 'running'])
+    assert.equal(roster.settle('s', 'call-1', { text: 'done' }), true)
+    assert.equal(roster.settle('s', 'call-9', { text: 'done' }), false, 'an unknown result changes nothing')
+    const rows = roster.list('s')
+    assert.equal(rows[0].state, 'completed')
+    assert.equal(rows[1].state, 'running', 'the sibling subagent is untouched')
+  })
+  await check('a backgrounded subagent is not reported as finished', () => {
+    // Its call answers "started …" while the child keeps working; calling that
+    // completed would be a claim the roster could never correct.
+    const roster = new SubagentRoster()
+    roster.note('s', 'call-1', 'subagent', JSON.stringify({ description: '长任务' }))
+    roster.settle('s', 'call-1', { text: 'started background subagent job job-7' })
+    assert.equal(roster.list('s')[0].state, 'running')
+    assert.equal(roster.list('s')[0].note, '后台运行中')
+    assert.match(subagentCard(roster.list('s')).body.elements[0].content, /后台运行中/)
+  })
+  await check('a backgrounded subagent remembers which child it waits for', () => {
+    const roster = new SubagentRoster()
+    roster.note('s', 'call-1', 'subagent', JSON.stringify({ description: '长任务' }))
+    roster.settle('s', 'call-1', { text: 'started subagent b7e1fbfc-e100' })
+    assert.equal(roster.list('s')[0].childId, 'b7e1fbfc-e100')
+    assert.equal(childIdIn('started background subagent job job-7'), 'job-7')
+    assert.equal(childIdIn('done already'), undefined, 'an ordinary result names no child')
+  })
+  await check('a settlement notice settles the row that waited for that child', () => {
+    const roster = new SubagentRoster()
+    roster.note('s', 'call-1', 'subagent', JSON.stringify({ description: '长任务' }))
+    roster.settle('s', 'call-1', { text: 'started subagent child-1' })
+    const summary = 'Background subagent child-1 finished and will do no further work unless you send it more.'
+    assert.equal(roster.finishChild('s', 'child-1', summary), true)
+    const row = roster.list('s')[0]
+    assert.equal(row.state, 'completed')
+    assert.equal(row.note, undefined, 'the running note goes away with the row')
+    assert.match(subagentCard(roster.list('s')).body.elements[0].content, /✅ \*\*长任务\*\* · 完成/)
+    assert.equal(roster.finishChild('s', 'child-1', summary), false, 'the same notice twice is not a rewrite')
+    assert.equal(roster.finishChild('s', 'child-9', summary), false, 'a child nobody waiting for changes nothing')
+  })
+  await check('every ending the platform records gets its own word', () => {
+    assert.deepEqual(settlementOutcome('Background subagent c finished and will do no further work unless you send it more.'), { state: 'completed', note: undefined })
+    assert.deepEqual(settlementOutcome('Background subagent c was stopped before it finished.'), { state: 'failed', note: '已中止' })
+    assert.deepEqual(settlementOutcome('Background subagent c ran out of room before it finished.'), { state: 'failed', note: '超出长度' })
+    assert.deepEqual(settlementOutcome('Background subagent c declined the task.'), { state: 'failed', note: '拒绝执行' })
+    assert.deepEqual(settlementOutcome('Background subagent c failed before it finished.'), { state: 'failed', note: '执行失败' })
+    assert.deepEqual(settlementOutcome('Background subagent c ended abnormally (boom) before it finished.'), { state: 'failed', note: '异常结束' })
+    assert.equal(settlementOutcome('something new the platform says').state, 'failed', 'an unnameable ending is never success')
+  })
+  await check('a catalog entry links a child to the row its delegation opened', () => {
+    const roster = new SubagentRoster()
+    roster.note('s', 'call-1', 'subagent', JSON.stringify({ description: '前端重构' }))
+    roster.note('s', 'call-2', 'subagent', JSON.stringify({ description: '改后端' }))
+    assert.equal(roster.linkChild('s', 'child-2', '改后端'), true)
+    assert.equal(roster.linkChild('s', 'child-1', 'a label that drifted'), true, 'an unknown label falls back to the newest waiting row')
+    assert.equal(roster.linkChild('s', 'child-9', '改后端'), false, 'every waiting row already has a child')
+    roster.finishChild('s', 'child-2', 'Background subagent child-2 failed before it finished.')
+    const rows = roster.list('s')
+    assert.deepEqual(rows.map((r) => r.state), ['running', 'failed'], 'the linked row settles, its sibling does not')
+    assert.equal(rows[1].label, '改后端')
+  })
+  await check('a catalog entry never rewrites a settled row', () => {
+    const roster = new SubagentRoster()
+    roster.note('s', 'call-1', 'subagent', JSON.stringify({ description: '一次性' }))
+    roster.settle('s', 'call-1', { text: 'the answer' })
+    assert.equal(roster.linkChild('s', 'child-1', '一次性'), false, 'a finished delegation waits for nobody')
+  })
+  await check('a failed delegation is marked failed, not completed', () => {
+    const roster = new SubagentRoster()
+    roster.note('s', 'call-1', 'subagent', JSON.stringify({ description: 'x' }))
+    assert.equal(roster.settle('s', 'call-1', { failed: true }), true)
+    assert.equal(roster.list('s')[0].state, 'failed')
+  })
+  await check('/new drops the roster too', () => {
+    const roster = new SubagentRoster()
+    roster.note('s', 'call-1', 'subagent', '{}')
+    roster.forget('s')
+    assert.deepEqual(roster.list('s'), [])
+  })
+  await check('the host wires the roster to the call AND its result', async () => {
+    const indexSource = await readFile(new URL('../index.js', import.meta.url), 'utf8')
+    assert.match(indexSource, /subagents\.note\(sessionId, data\?\.callId/)
+    assert.match(indexSource, /subagents\.settle\(sessionId, data\?\.message\?\.toolCallId/)
+    assert.match(indexSource, /resolved\.subagentCard && subagents\.note/)
+    assert.match(indexSource, /subagents\.forget\(previous\)/)
+  })
+  await check('the host wires a child ending back to the row waiting for it', async () => {
+    const indexSource = await readFile(new URL('../index.js', import.meta.url), 'utf8')
+    assert.match(indexSource, /case 'subagent\/catalog'/)
+    assert.match(indexSource, /subagents\.linkChild\(sessionId, data\?\.childId, data\?\.label\)/)
+    assert.match(indexSource, /source\?\.kind === 'subagent-settled'/)
+    assert.match(indexSource, /subagents\.finishChild\(sessionId, source\.senderSessionId, source\.summary\)/)
   })
 
   console.log('fan-out narration')

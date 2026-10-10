@@ -37,6 +37,7 @@ import { ReactionTracker } from './lib/react.js'
 import { Notices } from './lib/notice.js'
 import { ProgressCards } from './lib/progress.js'
 import { Fanout } from './lib/fanout.js'
+import { SubagentRoster } from './lib/subagents.js'
 import { installToolGuard } from './lib/guard.js'
 import { buildSendFileTool, resolveSendablePath } from './lib/outbound.js'
 import { DROP, admit, isPolicyDrop } from './lib/access.js'
@@ -214,6 +215,10 @@ export async function apply(ctx, config = {}) {
   const progress = new ProgressCards({ transport, sessions, logger })
   // Workflow and subagent narration lands in the live turn's process panel.
   const fanout = new Fanout({ logger })
+  // The subagent roster is the one trace of delegation that survives the turn:
+  // a child's own session is not served here, so it is built from the delegating
+  // call and its result rather than from the child's events.
+  const subagents = new SubagentRoster()
 
   const t = strings(resolved.locale)
   /** correlation id -> a card interaction waiting for a click. */
@@ -252,6 +257,7 @@ export async function apply(ctx, config = {}) {
         progress.forget(previous)
         notices.forget(previous)
         fanout.forget(previous)
+        subagents.forget(previous)
         const rotated = await sessions.rotate(key)
         // Bound here so the picker's callback is accepted: `serves()` is what
         // authorises a card action, and it reads the routing that `bind` sets.
@@ -1478,6 +1484,7 @@ export async function apply(ctx, config = {}) {
     progress.forget(previous)
     notices.forget(previous)
     fanout.forget(previous)
+    subagents.forget(previous)
     await sessions.use(key, target)
     // Keep answering where the conversation already answered, rather than to the
     // card that happened to be clicked.
@@ -1545,8 +1552,13 @@ export async function apply(ctx, config = {}) {
       }
 
       case 'tool/call': {
-        if (!resolved.showProcess) break
         const name = data?.name ?? 'tool'
+        // A delegation is tracked even with the process panel off: its roster is a
+        // card of its own, not part of this turn's narration.
+        if (resolved.subagentCard && subagents.note(sessionId, data?.callId, name, data?.arguments)) {
+          void progress.showSubagents(sessionId, subagents.list(sessionId))
+        }
+        if (!resolved.showProcess) break
         const phrase = describeCall(name, data?.arguments)
         renderer.addActivity(sessionId, phrase, true)
         renderer.setSubtitle(sessionId, phrase)
@@ -1556,12 +1568,39 @@ export async function apply(ctx, config = {}) {
       }
 
       case 'tool/result': {
+        if (resolved.subagentCard) {
+          // The result carries the call it answers, so exactly that row settles —
+          // several subagents may be running at once.
+          const settled = subagents.settle(sessionId, data?.message?.toolCallId, {
+            text: readAssistantContent(data?.message).text,
+            failed: data?.error !== undefined,
+          })
+          if (settled) void progress.showSubagents(sessionId, subagents.list(sessionId))
+        }
         if (!resolved.showProcess) break
         const error = data?.error
         if (error) {
           const reason = error.reason ? ` · ${error.reason}` : ''
           renderer.addActivity(sessionId, `⚠️ 失败${reason}`)
           renderer.setSubtitle(sessionId, `⚠️ ${error.name ?? 'tool'} 失败`)
+        }
+        break
+      }
+
+      case 'subagent/catalog': {
+        // The parent's own durable fact about a direct child: the only event here
+        // that names the child by id, which is what a settlement notice arrives as.
+        if (resolved.subagentCard) subagents.linkChild(sessionId, data?.childId, data?.label)
+        break
+      }
+
+      case 'user/message': {
+        // A child's ending reaches this session as a user message whose source
+        // names both the child and how it ended. Only that settles a waiting row.
+        const source = data?.source ?? data?.message?.source
+        if (resolved.subagentCard && source?.kind === 'subagent-settled') {
+          const settled = subagents.finishChild(sessionId, source.senderSessionId, source.summary)
+          if (settled) void progress.showSubagents(sessionId, subagents.list(sessionId))
         }
         break
       }
@@ -1753,6 +1792,7 @@ export async function apply(ctx, config = {}) {
       notices.dispose()
       progress.dispose()
       fanout.dispose()
+      subagents.dispose()
       await renderer.dispose()
       await transport.stop()
     })()

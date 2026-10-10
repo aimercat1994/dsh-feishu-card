@@ -33,8 +33,10 @@ lib/
   present.js          工具展示：分类、图标、短语、diff、token 格式化
   notice.js           通知：格式化 + 投递（回合内进面板，回合外发卡）
   react.js            反应反馈：换挡与终态一次性
-  progress.js         todo / goal 卡片：独立实体、原位更新
+  progress.js         todo / goal / 子代理卡片：独立实体、原位更新
   fanout.js           工作流 / 子代理叙述
+  subagents.js        子代理名册：从委派调用 + 它的结果维护"这个聊天委派了什么"，
+                      并用 subagent/catalog 与 subagent-settled 回收后台子代理的结局
   guard.js            工具守卫：按名称拒绝工具，纯判定 + 默认放行的容错
   media.js            入站媒体：类型嗅探、富文本解析、有界流收集
   images.js           图片流水线：逐张下载/校验/组装 prompt，失败只损失该张
@@ -47,7 +49,7 @@ lib/
   access.js           入站准入：谁可以开对话、为什么被丢弃（纯函数）
   log.js              控制台 + 落盘双写日志
 client/client.js     浏览器一半：插件管理页里的配置表单（手写、免构建）
-test/offline.mjs      162 项离线断言
+test/offline.mjs      283 项离线断言
 ```
 
 **职责边界**（改动时请维持）：
@@ -88,6 +90,8 @@ test/offline.mjs      162 项离线断言
 `turn/start` · `turn/end` · `step/start` · `tool/call` · `tool/result` · `assistant/message` · `request/context` · `todo/write` · `goal/change` · `tool-workflow/run-start|agent-start|agent-end|run-end` · `subagent/descriptor`
 
 > ⚠️ **发现陷阱（踩过两次）**：`todo/write`、`tool-workflow/*`、`subagent/*`、`goal/change` **不在 `dsh-session` 自己的 `SessionEventMap` 里**——它们由各自的工具包通过 **module augmentation** 声明。只 grep 宿主包一定会漏。要枚举完整事件集，必须搜所有 `*/lib/types/*.d.ts` 里的 `interface SessionEventMap`。
+
+> ⚠️ **`subagent/descriptor` 到不了这里**：它由 `dsh-subagent` 写在**子会话**里（`child.session.append(...)`），而本插件只服务自己绑定的飞书会话（`ConversationSessions.serves()`），所以这条事件一律在门口被丢。即便放行，它的载荷（`version/mode/provider/label`）也**没有终态字段**，只能报"开始了"。子代理的痕迹因此改由**被服务会话自己的事件**建立（`tool/call` + `tool/result`，再用 `subagent/catalog` 与子代理结束时发到本会话的 `subagent-settled` 通知回收结局），见 4.6。
 
 ## 4. 数据流
 
@@ -177,6 +181,44 @@ session/event: goal/change → showGoal()  同上；clear 墓碑（无 goal 快�
 
 goal 卡片按钮 → `onCardAction` → `applyGoalOperation()` → **真正调用 `ctx.goals.pause/resume/clear`**，再用返回的新快照重绘（不是本地改数字）。
 
+### 4.6 子代理名册
+
+子代理的**会话**不在这里服务（见 §3 的告警），所以名册只能从委派方自己的事件建立：
+
+```
+session/event: tool/call   （name 是 subagent 时）
+  → SubagentRoster.note(sessionId, data.callId, name, data.arguments)
+      行的标签取 description → label → prompt 里第一个非空者，状态 running
+  → ProgressCards.showSubagents()   每个聊天一张卡，首次 createCard+sendCard，之后 updateCard
+
+session/event: tool/result （data.message.toolCallId 回指那次调用）
+  → SubagentRoster.settle(sessionId, toolCallId, { text, failed })
+      failed                 → failed
+      text 以 "started" 开头  → 仍是 running，加注"后台运行中"，
+                               并从 `started subagent <id>` 里记下 childId
+      否则                   → completed
+  → ProgressCards.showSubagents()
+
+session/event: subagent/catalog （父会话自己持有的持久事实，形如
+                                  {childId, childCreatedAt, mode, label}）
+  → SubagentRoster.linkChild(sessionId, childId, label)
+      给还没有 childId 的 running 行点名：先按 label 匹配，再退回最新的等待行
+  （卡片内容不变，不重写）
+
+session/event: user/message  （source.kind === 'subagent-settled'）
+  → SubagentRoster.finishChild(sessionId, source.senderSessionId, source.summary)
+      senderSessionId 就是 childId，只结算等待该 id 的那一行
+  → ProgressCards.showSubagents()
+```
+
+卡片形态：`🤖 子代理 已完成数/总数`，每行 `⏳/✅/❌ **任务** · 进行中/完成/失败（· 原因）`，最多 8 行 + `…还有 N 个`；全部落定才转绿，其中有失败则转红。
+
+**为什么用 `callId` 关联而不是"最后一个 running 的行"**：一个回合可以同时委派多个子代理，结果到达的顺序不保证；只有回指的 `toolCallId` 能让每个结果只结算它自己那一行。
+
+**后台子代理的结局由平台自己的通知结算**：`started …` 那一行不会被判完成，但也不能永远挂着。父会话里有两件事可以接上——`subagent/catalog` 按 id 点名刚建出来的子代理，子代理结束时平台又以 `user/message` 的形式发来一条通知，其 `source.senderSessionId` 就是同一个 id。`finishChild()` 只认这条通知，并按它 `summary` 的句式判成功或失败（`settlementSummary()` 在 `@deepseek-ai/dsh-subagent` 里只有一句是成功；读不懂的句式一律判失败）。**没有任何"猜一个完成"的路径**：名册宁可不更新，也不写一个自己纠正不了的结论。
+
+**每张进度卡一条写入链**：`ProgressCards` 把 `${sessionId}\0${kind}` 映射到链尾 Promise，同一张卡的写入按到达顺序排队，所以"建卡"只发生在队列的第一个写入里，后面排队的快照落地成 `updateCard`。名册天然会踩这个竞态——`tool/call` 刚建好卡，"后台运行中"的改写就在 48 毫秒后到了。
+
 ## 5. 关键不变量
 
 改动代码时这些必须继续成立，`test/offline.mjs` 里有对应断言：
@@ -192,6 +234,12 @@ goal 卡片按钮 → `onCardAction` → `applyGoalOperation()` → **真正调�
 | **流式会话会过期，必须能识别 200850 / 300309 并续期** | 平台在开启 10 分钟后关闭流式模式，写不会顺延；不续期就静默停更 |
 | **元素写入失败必须降级，不能放弃整张卡** | `card.update` 不依赖流式模式；放弃等于让用户盯着不动的卡 |
 | **不写空内容、不写未变化的内容** | 空内容写入被平台拒绝（HTTP 400）；重复写浪费 sequence |
+| **一行叙述必须读出"这一笔在做什么"** | `targetOf()` 的键表漏了工具真正传的键（`url`/`name`）时，用户看到的就是一个光秃秃的工具名 |
+| **过程面板里的两股内容必须靠编号或标题分开** | 思考与工具相邻堆放时，多段思考读起来是连续一段，分不清哪句属于哪一步 |
+| **一张进度卡在同一时刻只能有一个写入在飞** | 建卡要一次往返，而喂卡的事件常常比它更快（`tool/call` 建卡、48 毫秒后 `started …` 的结果就要改写它）；没有这条，第二份快照会在第一张卡还没拿到 id 时再建一张，双胞胎里那张永远停在第一帧 |
+| **子代理名册只由被服务会话自己的事件建立** | 子代理自己的会话不在这里服务（`subagent/descriptor` 一律被 `serves()` 挡掉），host 的 `subagent/start\|end` 又不带委派会话；可用的是本会话的 `tool/call` + `tool/result`、父会话持有的 `subagent/catalog`，以及子代理结束时发到这里的 `subagent-settled` 通知 |
+| **结果以 `started` 开头的委派不算完成** | 后台/可续跑的子代理在子代理仍在跑时就返回；标成完成是这张卡永远无法纠正的谎 |
+| **子代理的结局只由平台的结算通知判定，读不懂的句式判失败** | 只有 `finished and will do no further work` 是成功；把"没读懂的结尾"当成功，等于让卡片替平台宣布一件它并不知道的事 |
 | **头部/决策块变化必须走整卡 `card.update`** | 它们不是可寻址元素，元素写入够不到 |
 | **waterfall 里的纯观察者必须 `next()`** | 不交还会吞掉宿主或其他插件的处理 |
 | **叙述/通知的格式化失败不能抛** | 叙述出错不该毁掉一个正在跑的回合（都包了 try/catch） |
@@ -205,6 +253,12 @@ goal 卡片按钮 → `onCardAction` → `applyGoalOperation()` → **真正调�
 
 **为什么过程面板运行中展开、完成后折叠**
 折叠状态下内容写进去了但看不见——用户会以为"什么都没发生"。运行中展开才有实时感；完成后正文优先，面板折起来。
+
+**为什么过程面板里要给思考编号、给工具时间线加标题**
+面板里两股内容的语义完全不同：`reasoning` 是模型对**当前这一步**的想法，`activity` 是**这一步做了什么**。原先两者直接相邻堆放，一个回合里有几段思考就糊成连续一大段——读者分不清哪句话属于哪一步。现在每段思考带 `**思考N**`（`numberedReasoning()` 连续编号、空段跳过，**进行中的那段也带编号**，所以它落定时编号不会变），工具时间线整体带 `**工具调用**` 前缀，两者之间插一个恒存在的 `hr`（`ELEMENTS.processSep`）。刻意用**恒存在**的元素而不是按需插入：流式期间节点位置一变，客户端布局就跳。标题在 `#elementContent`（流式元素写）和 `document()`（终态整卡写）**两处都套**，否则面板会在"流式中"和"终态"之间换脸。
+
+**为什么工具行必须自带内容，后台任务的 label 必须压缩**
+一行叙述的价值全在"这一笔在做什么"：`🔧 \`compress\`` 与 `🗜️ \`compress\` 4 段 · m00001–m00004 会话背景` 差着一次点击。所以 `targetOf()` 的键表要覆盖各工具**真正传参**的键（`url`、`name`…），没有路径也没有命令的工具（`compress`）要有自己的分支 `compressedRanges()`。同理，`job.label` 是**整条 shell 命令**——它适合日志，不适合卡片；`jobLine()` 把它压成单行 ≤80 字符并前缀任务 id。
 
 **为什么规划里正文永远在过程上面**
 读者要的是答案。把过程堆在顶上会让每次回复都从滚动开始。

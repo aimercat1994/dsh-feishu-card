@@ -5,7 +5,7 @@
 ```
 index.js               入口（唯一接线层）
 lib/*.js               见 ARCHITECTURE.md 的模块地图
-test/offline.mjs       102 项离线断言，不连飞书
+test/offline.mjs       283 项离线断言，不连飞书
 cordis.patch.yml       bundle patch：插入 feishu-card 这一行
 package.json           声明 dsh.bundle.patch 与依赖
 docs/                  本目录
@@ -214,5 +214,6 @@ pnpm 会报 `ERR_PNPM_IGNORED_BUILDS: protobufjs`。这是 `@larksuiteoapi/node-
 | `approvers` | 逻辑已写并离线覆盖；但本部署文件策略为 `danger-full-access`，**审批从未被触发**，所以「非审批人点击被拒」这条只在代码层面成立 |
 | 审批卡片真实点击 | 本部署文件策略为 `danger-full-access`，**没有触发过审批**，所以审批路径只在离线断言和建卡层面验证过 |
 | 群聊 / `chat-thread` / `chat-sender` 作用域 | 只在私聊 `chat` 作用域实测过 |
+| 子代理名册卡（0.3.4） | 卡片构造、`callId` 精确结算、`started …` 不判完成、宽扇出裁剪都有离线断言；**没有在真实 API 上建过卡**，`started …` 那条分支也**没有被一次真实的委派驱动过**。要补：在这里委派一个后台子代理，看卡片是否出现、是否停在"进行中" |
 | 流式会话过期（200850/300309）的恢复 | 平台行为**已用真实 API 直接验证**：同一张卡 +300/+500/+582s 写成功、+615s 报 200850、再写报 300309、`card.settings` 续期 `code=0`、紧接的元素写成功（见 PLATFORM-NOTES 4c）。**但"一个真跑过 10 分钟、中途不断更"的回合还没在飞书里跑过**——那需要一次真的超过 10 分钟的回合 |
 | `output: cot` | 未实现 |

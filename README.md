@@ -42,6 +42,7 @@
 - 用户消息上的反应反馈：`OK` → `THINKING` → `DONE` / `ERROR`
 - 通知：模型重试、上下文用量、压缩失败、后台任务结束
 - todo 与 goal **各占一张独立卡片、跨回合存活**；goal 按钮真正调用 `ctx.goals`
+- 子代理**一张常驻卡片**：逐行显示委派出去的子代理，`⏳ 进行中 / ✅ 完成 / ❌ 失败`，全部落定才转绿
 - 工作流 / 子代理扇出叙述
 
 **图片输入**（`images`，默认开启）
@@ -107,10 +108,10 @@ github:aimercat1994/dsh-feishu-card
 想锁定版本，用 release 标签（实测可用）：
 
 ```
-github:aimercat1994/dsh-feishu-card#v0.3.3
+github:aimercat1994/dsh-feishu-card#v0.3.4
 ```
 
-当前版本 **v0.3.3** — [Release 说明](https://github.com/aimercat1994/dsh-feishu-card/releases/tag/v0.3.3) · [变更历史](CHANGELOG.md)
+当前版本 **v0.3.4** — [Release 说明](https://github.com/aimercat1994/dsh-feishu-card/releases/tag/v0.3.4) · [变更历史](CHANGELOG.md)
 
 ### 等价的命令行做法
 
@@ -191,6 +192,7 @@ FEISHU_DOMAIN=              # 国际版 Lark 填 https://open.larksuite.com
     # 渲染
     readingPreset: classic               # classic | focused | detailed | task
     showProcess: true                    # 是否显示过程面板
+    subagentCard: true                   # 是否为子代理单独发一张常驻卡片
     hideProcessWhenDone: false           # 回合结束后强制折叠过程面板
     widthMode: default                   # default | compact | fill（仅 JSON 2.0 卡片）
     flushIntervalMs: 400                 # 流式写入合并间隔
@@ -295,11 +297,11 @@ FEISHU_DOMAIN=              # 国际版 Lark 填 https://open.larksuite.com
 node test/offline.mjs
 ```
 
-259 项断言，**不连飞书**，覆盖：卡片结构与 `element_id` 平台规则、四种阅读预设版式、流式合并与去重、已提交正文不与实时 delta 重复计、**流式会话过期（200850/300309）的分类与续期**、**过期后降级为整卡重写**、**同一卡片的写入串行化（300317）**、连续失败预算、卡片创建幂等与竞态、会话键单射性、session ladder 三档阶梯、`/new` 轮换与重启持久化、命令委派与降级、工具分类与 diff 提取、反应换挡序列与终态一次性、通知阈值跨越、进度卡原位更新与过期恢复、扇出计数与畸形载荷降级、命令面板的增删改计划、模型与档位解析、会话选择与切换（含 `use()` 持久化）、模式锁判断与中文名映射、`/help` 卡片的按钮与破坏性判定、命令用法提示、附件透传。
+283 项断言，**不连飞书**，覆盖：卡片结构与 `element_id` 平台规则、四种阅读预设版式、流式合并与去重、已提交正文不与实时 delta 重复计、**流式会话过期（200850/300309）的分类与续期**、**过期后降级为整卡重写**、**同一卡片的写入串行化（300317）**、连续失败预算、卡片创建幂等与竞态、会话键单射性、session ladder 三档阶梯、`/new` 轮换与重启持久化、命令委派与降级、工具分类与 diff 提取、**工具行自带内容（`url`/`name` 与 `compress` 的压缩范围）**、**`subagent` 行的任务名**、**后台任务 label 压成单行 ≤80 字符**、**过程面板的思考编号与工具时间线标题、`process_sep` 分隔**、反应换挡序列与终态一次性、通知阈值跨越、进度卡原位更新与过期恢复、**子代理名册按 `callId` 精确结算、`started …` 不判完成、后台子代理的结局由平台结算通知回收（读不懂的句式判失败）、宽扇出裁剪、一到一张卡（建卡途中到达的快照也复用同一张）**、扇出计数与畸形载荷降级、命令面板的增删改计划、模型与档位解析、会话选择与切换（含 `use()` 持久化）、模式锁判断与中文名映射、`/help` 卡片的按钮与破坏性判定、命令用法提示、附件透传。
 
 其中若干条是**结构断言**，针对的是"语法合法但语义已坏"的情形——例如命令分支不得重复、不得为空块、每条命令都必须有分支。这类 bug 不抛错、不打日志，普通单元测试发现不了（一次真实事故：`/status` 分支被重复一行成了空块，命令静默什么都不做）。
 
-**另有真实飞书 API 验证**（需要凭据）：全部卡片形状（回合卡 ×4 预设、决策卡 ×4 形态、通知卡、进度卡 ×7）逐一建卡成功，以及"往折叠面板内部元素流式写入"这条高风险路径。验证脚本模式见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
+**另有真实飞书 API 验证**（需要凭据）：全部卡片形状（回合卡 ×4 预设、决策卡 ×4 形态、通知卡、进度卡 ×7）逐一建卡成功，以及"往折叠面板内部元素流式写入"这条高风险路径。0.3.4 新增的**子代理名册卡**与"`started …` 不判完成"这条路**还没在真实 API 上建过卡**。验证脚本模式见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 
 ## 已知限制
 

@@ -132,13 +132,21 @@ renderer.begin(sessionId, routing)
 delta 到达（agent/assistant-stream）
   → addLiveAnswer / addLiveReasoning  只进内存缓冲，标脏
   → #schedule()  → 默认 400ms 后 flush
-                    └─ 元素写入：transport.streamElement(cardId, elementId, content)
+
+flush() → #write()  逐轮挂在 chain 上串行，同一张卡不会有两笔写并发（否则 300317）
+  ├─ 距上次续期 ≥ 8 分钟 → setStreaming(on) 先续期
+  │                       （平台 10 分钟后关流式模式，且写不会顺延）
+  ├─ !streaming 或 fullDirty → 一次 transport.updateCard(整卡)
+  └─ 否则逐元素 transport.streamElement(cardId, elementId, content)
+        ├─ 200850 / 300309 → 会话已被平台关闭 → 续期并重试
+        └─ 连续失败到达预算 → 降级为整卡重写；整卡也连续失败 → 本轮不再实时更新
 
 提交到达（session/event: assistant/message）
   → commitAssistant()  把实时缓冲折进"已提交"区并清空实时区
 
 turn/end
-  → finish()  一次 transport.updateCard(整卡) + 关闭流式 + 释放 sequence 计数
+  → finish()  先等 chain 排空（免得流式写落在关流式之后）
+             → 一次 transport.updateCard(整卡) + 关闭流式 + 释放 sequence 计数
 ```
 
 ### 4.4 交互往返
@@ -155,6 +163,8 @@ approval/request（waterfall，prepend）
 ```
 
 点击入口是 WS 的 `card.action.trigger` → `onCardAction()`，校验：卡片所属 chat 必须匹配、配置了 `approvers` 时必须是其中之一。表单提交走按钮 `name` 里的关联 id（见 PLATFORM-NOTES）。
+
+超时前的提醒走**整卡重写**（`updateCard` + `buildDecisionCard`）。决策卡没有 `streaming_mode`，不是流式卡，对它做元素写入只会拿到 300309——那是一条注定失败的路径，原来还被 `.catch(() => {})` 吞掉，日志里什么都不留。
 
 ### 4.5 进度卡片
 
@@ -178,6 +188,9 @@ goal 卡片按钮 → `onCardAction` → `applyGoalOperation()` → **真正调�
 | **实时 delta 与已提交正文分开累加** | 两者描述同一段文本；相加会让每句答案印两遍 |
 | **`begin()` 幂等且并发安全** | 入站消息与 `turn/start` 几乎同时触发，否则会开两张卡 |
 | **`sequence` 严格递增，每个 `card_id` 一个计数器** | 平台强制；计数器归 `feishu.js` 独有 |
+| **同一张卡的写入必须串行** | 两笔并发写按"到达顺序"比 `sequence`，乱序到达就是 300317 |
+| **流式会话会过期，必须能识别 200850 / 300309 并续期** | 平台在开启 10 分钟后关闭流式模式，写不会顺延；不续期就静默停更 |
+| **元素写入失败必须降级，不能放弃整张卡** | `card.update` 不依赖流式模式；放弃等于让用户盯着不动的卡 |
 | **不写空内容、不写未变化的内容** | 空内容写入被平台拒绝（HTTP 400）；重复写浪费 sequence |
 | **头部/决策块变化必须走整卡 `card.update`** | 它们不是可寻址元素，元素写入够不到 |
 | **waterfall 里的纯观察者必须 `next()`** | 不交还会吞掉宿主或其他插件的处理 |

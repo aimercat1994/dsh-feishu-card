@@ -1065,9 +1065,15 @@ export async function apply(ctx, config = {}) {
         resolved.approvalReminderMs > 0
           ? setTimeout(() => {
               if (!inCard) {
+                // A standalone decision card is never a streaming card (its
+                // buttons are the point, and `buildDecisionCard` sets no
+                // `streaming_mode`), so `cardElement.content` could only ever
+                // fail here with 300309. Replace the whole card instead — the
+                // same path `finish` uses below, and the one that keeps working
+                // however long the decision is left waiting.
                 void transport
-                  .streamElement(cardId, ELEMENTS.prompt, `${body}\n\n_仍在等待你的选择…_`)
-                  .catch(() => {})
+                  .updateCard(cardId, buildDecisionCard({ ...interaction, body: `${body}\n\n_仍在等待你的选择…_` }))
+                  .catch((error) => logger?.warn?.('[feishu-card] nudging a decision card failed', error))
                 return
               }
               renderer.setInteraction(sessionId, {

@@ -222,6 +222,46 @@ ErrMsg: form's name is required and can not be empty string
 
 要验证卡片更新只能看客户端，或用 `update_time` 之类的间接信号。
 
+---
+
+## 4c. 流式会话有 10 分钟寿命 —— 报 200850 / 300309
+
+**`streaming_mode: true` 的卡片不是"一直能流式写"。** 平台在**距上次开启 10 分钟**时自动关闭这条会话，此后：
+
+| 时机 | 第一个失败的写 | 之后每一个写 |
+| --- | --- | --- |
+| 超过 10 分钟 | `code=200850` `card streaming timeout` | `code=300309` `streaming mode is closed` |
+
+实测（本部署日志，两张卡）：11:05:40 建卡 → 11:15:45 首次 200850，**10 分 04 秒**；00:31:32 建卡 → 00:41:31 首次 200850，**9 分 59 秒**。此后每个 flush（约 400ms 一次）都收到 300309。
+
+受控实测（同一张卡，真实 API 依次写 `elements/answer/content`）：
+
+| 时刻 | 操作 | 结果 |
+| --- | --- | --- |
+| +300s | 元素写 | `code=0` |
+| +500s | 元素写 | `code=0` |
+| +582s | 元素写 | `code=0` |
+| +615s | 元素写 | `code=200850` `card streaming timeout` |
+| +615s | 再写一次 | `code=300309` `streaming mode is closed` |
+| +615s | `card.settings` `streaming_mode: true`（**PATCH**） | `code=0` |
+| +617s | 元素写 | `code=0` |
+| 续期后 +615s | 元素写 | `code=200850` |
+
+**+582s 写过也没用**——这直接证明写操作不续期；关闭后的续期成功，且续期后立刻就能继续写。**窗口从续期那一刻重算**：续期后 +615s 又报 200850。
+
+**这不是"闲置超时"，是寿命。** 本部署测到的两张卡都在**持续写**（flush 每 400ms 一次），照样到点关闭——**写操作不续期**。所以心跳保活**不是**修法：一个真的跑过 10 分钟的回合仍然会撞上它。（上游还报过另一种触发：长工具阶段里没有正文写入时的 200850。两种情况的表现与修法相同。）
+
+**修法是"重新开启"。** 对已存在的卡片实体再调一次 `cardkit.v1.card.settings`（`streaming_mode: true`）即可开启流式更新，窗口从这一刻重新开始。两条路都要有，缺一条都不够：
+
+- **提前续期**：距上次续期超过 8 分钟的**下一笔写之前**先续一次，长回合根本不会掉进关闭里。检查挂在写路径上，所以"安静很久（长工具阶段）再恢复写"也走同一条路——那第一笔写先续期，**连一次失败的写都不会有**
+- **被动恢复**：把 200850 / 300309 认成"会话已关闭"，续期后重试那一笔写（兜住"续期与写之间刚好关闭"和"续期这次调用本身失败"）
+
+**降级比"当作终止"更值得做。** 万一确实续不上（例如平台不再允许），`cardkit.v1.card.update` **不依赖流式会话**，可以继续整卡重写——用户看到的是"没有打字机效果"，而不是"卡片停在半句话上不动"。200850 与 300309 只出现在 `cardElement.content` 上，`card.create` / `card.update` 不受影响。
+
+> 反向的坑：往**从未开启流式**的卡片写 `cardElement.content`，报的也是 300309。所以给决策卡（`buildDecisionCard` 不开流式）加"仍在等待"提醒**不能走 `streamElement`**，得走 `card.update`——否则那笔写只能失败，而它当时被一个空 catch 吞掉了。
+
+**`sequence` 必须严格递增，而且是按到达顺序比较的。** 并发两笔写会按**调用顺序**取号、按**完成顺序**到达，后到的那笔被拒：`code=300317` `sequence number compare failed`。所以同一张卡上的写必须**串行**——这不是性能问题，是正确性问题。
+
 ## 5. API 清单
 
 ### CardKit（卡片实体）
@@ -229,9 +269,9 @@ ErrMsg: form's name is required and can not be empty string
 | 操作 | 接口 | 说明 |
 | --- | --- | --- |
 | 建实体 | `cardkit.v1.card.create` | `{type:'card_json', data: <JSON 字符串>}` → `card_id` |
-| 流式开关 | `cardkit.v1.card.settings` | `{settings: JSON 字符串, sequence}` |
-| 整卡重写 | `cardkit.v1.card.update` | `{card:{type,data}, sequence}` |
-| 元素内容 | `cardkit.v1.cardElement.content` | `{content, sequence}`，**空串会被拒** |
+| 流式开关 | `cardkit.v1.card.settings` | `{settings: JSON 字符串, sequence}`，可对已存在的实体开启/关闭；**会话有 10 分钟寿命，见第 4c 节** |
+| 整卡重写 | `cardkit.v1.card.update` | `{card:{type,data}, sequence}`，**不依赖流式会话**（关闭后的降级路径） |
+| 元素内容 | `cardkit.v1.cardElement.content` | `{content, sequence}`，**空串会被拒**；**只在流式会话内有效** |
 | 元素替换 | `cardkit.v1.cardElement.update` | `{element: JSON 字符串, sequence}` |
 
 **`sequence` 必须严格递增，每个 `card_id` 一个计数器。** 计数器只由 `feishu.js` 持有，调用方永远不碰。

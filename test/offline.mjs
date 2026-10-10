@@ -28,7 +28,7 @@ import {
   invalidElementIds,
   settledDecisionElements,
 } from '../lib/card.js'
-import { TurnRenderer } from '../lib/turn.js'
+import { MAX_WRITE_FAILURES, STREAM_REFRESH_MS, TurnRenderer } from '../lib/turn.js'
 import { ConversationSessions, conversationKey, makeWorkspaceFiler, sessionIdFor } from '../lib/session.js'
 import { DESTRUCTIVE_COMMANDS, buildHelpCard, isDestructive } from '../lib/help-card.js'
 import {
@@ -58,7 +58,7 @@ import {
 } from '../lib/model.js'
 import { describeCall, describeDiff, formatTokens, kindOf } from '../lib/present.js'
 import { REACTION, ReactionTracker } from '../lib/react.js'
-import { FeishuTransport } from '../lib/feishu.js'
+import { FeishuTransport, STREAM_CLOSED_CODES, isStreamingClosed } from '../lib/feishu.js'
 import { Notices, compactionFailedLine, jobLine, pressureLine, retryLine } from '../lib/notice.js'
 import { PROGRESS_ELEMENTS, ProgressCards, goalCard, todoCard } from '../lib/progress.js'
 import {
@@ -131,6 +131,81 @@ class FakeTransport {
   lastStream(elementId) {
     const hits = this.streams.filter((s) => s.elementId === elementId)
     return hits.length ? hits[hits.length - 1].content : undefined
+  }
+}
+
+/**
+ * A transport that fails card writes the way Feishu does.
+ *
+ * Reproduces the two shapes the card lifecycle has to tell apart: a closed
+ * streaming session (`200850`/`300309`, recoverable by re-enabling it) and an
+ * ordinary failure. It also records how many writes were ever in flight at
+ * once, which is the invariant behind the platform's "sequence number compare
+ * failed" answer.
+ */
+class FlakyTransport extends FakeTransport {
+  /**
+   * @param streamErrors - codes `streamElement` fails with, consumed in order.
+   * @param settingsErrorAfter - fail `setStreaming` from this call index on.
+   */
+  constructor({ streamErrors = [], settingsErrorAfter } = {}) {
+    super()
+    this.streamErrors = [...streamErrors]
+    this.settingsErrorAfter = settingsErrorAfter
+    this.streamCalls = 0
+    this.settingsEnabled = []
+    this.inFlight = 0
+    this.maxInFlight = 0
+    /** Every write in completion order, to pin what happened when. */
+    this.order = []
+    /** Resolves when the first element write begins, so a test can interleave. */
+    this.streamStarted = new Promise((resolve) => {
+      this.markStreamStarted = resolve
+    })
+  }
+
+  /** The error the platform raises for one of its own codes. */
+  static error(code) {
+    const message =
+      code === 200850 ? 'card streaming timeout' : code === 300309 ? 'streaming mode is closed' : 'internal error'
+    const error = new Error(`[feishu-card] cardkit write failed: code=${code} msg=ErrMsg: ${message};`)
+    error.code = code
+    if (STREAM_CLOSED_CODES.has(code)) error.streamClosed = true
+    return error
+  }
+
+  async setStreaming(cardId, enabled) {
+    const call = this.settingsEnabled.length
+    this.settingsEnabled.push(enabled)
+    if (this.settingsErrorAfter !== undefined && call >= this.settingsErrorAfter) {
+      throw FlakyTransport.error(300309)
+    }
+    this.order.push(`settings:${enabled}`)
+    await super.setStreaming(cardId, enabled)
+  }
+
+  async streamElement(cardId, elementId, content) {
+    this.streamCalls++
+    this.inFlight++
+    this.maxInFlight = Math.max(this.maxInFlight, this.inFlight)
+    this.markStreamStarted?.()
+    this.markStreamStarted = undefined
+    try {
+      // A real write is a round trip; overlapping rounds need that gap to show.
+      await settle()
+      const code = this.streamErrors.shift()
+      if (code !== undefined) throw FlakyTransport.error(code)
+      this.order.push(`element:${elementId}`)
+      await super.streamElement(cardId, elementId, content)
+    } finally {
+      this.inFlight--
+    }
+  }
+
+  async updateCard(cardId, card) {
+    await settle()
+    this.order.push('card')
+    await super.updateCard(cardId, card)
   }
 }
 
@@ -392,6 +467,161 @@ async function main() {
     assert.equal(rows[0].columns.length, 4)
     assert.equal(rows[0].flex_mode, 'flow')
     assert.equal(buttonsOf(d).length, 7, 'six options plus skip')
+  })
+
+  console.log('a card streaming session expires mid-turn')
+  await check('a closed session is told apart from an ordinary failed write', () => {
+    // These two are what Feishu answers with once it has closed a card's
+    // streaming session. Neither is a bug in the write; both mean "re-open it".
+    assert.deepEqual([...STREAM_CLOSED_CODES].sort(), [200850, 300309])
+    assert.ok(isStreamingClosed(Object.assign(new Error('x'), { code: 300309 })))
+    assert.ok(isStreamingClosed(Object.assign(new Error('x'), { code: 200850 })))
+    assert.ok(!isStreamingClosed(Object.assign(new Error('x'), { code: 2200 })))
+    assert.ok(!isStreamingClosed(undefined))
+  })
+  await check('the streaming session is refreshed before the platform closes it', () => {
+    // Feishu closes streaming mode ten minutes after it was last enabled, so a
+    // refresh scheduled at or after that mark would always be too late.
+    assert.ok(STREAM_REFRESH_MS < 10 * 60 * 1000, `${STREAM_REFRESH_MS}ms is not before the close`)
+  })
+
+  const st4 = new FlakyTransport({ streamErrors: [300309] })
+  const sr4 = new TurnRenderer({ transport: st4, flushIntervalMs: 10_000 })
+  await sr4.begin('s4', { chatId: 'c4' })
+  sr4.addLiveAnswer('s4', '第一段')
+  await sr4.flush('s4')
+  await check('a write refused for a closed session re-enables streaming', () => {
+    assert.deepEqual(st4.settingsEnabled, [true, true], 'the settings call is retried')
+    assert.equal(st4.streams.length, 0, 'the refused write did not land')
+  })
+  await sr4.flush('s4')
+  await check('the retry after re-opening lands the text that was refused', () => {
+    assert.equal(st4.lastStream(ELEMENTS.answer), '第一段')
+  })
+  await sr4.finish('s4', {})
+
+  const st5 = new FlakyTransport({ streamErrors: [300309], settingsErrorAfter: 1 })
+  const sr5 = new TurnRenderer({ transport: st5, flushIntervalMs: 10_000 })
+  await sr5.begin('s5', { chatId: 'c5' })
+  sr5.addLiveAnswer('s5', '第二段')
+  await sr5.flush('s5')
+  await sr5.flush('s5')
+  await check('a session that cannot be re-opened still renders the answer', () => {
+    assert.equal(st5.streams.length, 0, 'no element write ever landed')
+    assert.match(JSON.stringify(st5.updates.at(-1).card), /第二段/)
+  })
+  await check('the fallback does not hammer the element API', () => {
+    assert.equal(st5.streamCalls, 1, `streamElement called ${st5.streamCalls} times`)
+  })
+  await sr5.finish('s5', {})
+
+  const st6 = new FlakyTransport({ streamErrors: [2200, 2200, 2200, 2200, 2200] })
+  const sr6 = new TurnRenderer({ transport: st6, flushIntervalMs: 10_000 })
+  await sr6.begin('s6', { chatId: 'c6' })
+  sr6.addLiveAnswer('s6', '第三段')
+  for (let round = 0; round < 6; round++) await sr6.flush('s6')
+  await check('repeated ordinary failures fall back instead of retrying forever', () => {
+    assert.equal(st6.streamCalls, MAX_WRITE_FAILURES, `streamElement called ${st6.streamCalls} times`)
+    assert.match(JSON.stringify(st6.updates.at(-1).card), /第三段/)
+  })
+  await sr6.finish('s6', {})
+
+  const st7 = new FlakyTransport()
+  const sr7 = new TurnRenderer({ transport: st7, flushIntervalMs: 10_000, streamRefreshMs: 0 })
+  await sr7.begin('s7', { chatId: 'c7' })
+  sr7.addLiveAnswer('s7', '第四段')
+  await sr7.flush('s7')
+  await check('streaming is re-enabled before the platform closes it', () => {
+    assert.deepEqual(st7.settingsEnabled, [true, true], 'the window is refreshed proactively')
+  })
+  await check('the refresh lands before the write it protects', () => {
+    assert.deepEqual(st7.order, ['settings:true', 'settings:true', `element:${ELEMENTS.answer}`])
+  })
+  await sr7.finish('s7', {})
+
+  const st8 = new FlakyTransport()
+  const sr8 = new TurnRenderer({ transport: st8, flushIntervalMs: 10_000 })
+  await sr8.begin('s8', { chatId: 'c8' })
+  sr8.addLiveAnswer('s8', '第五段')
+  await Promise.all([sr8.flush('s8'), sr8.flush('s8'), sr8.flush('s8')])
+  await check('overlapping flushes never write to the card at the same time', () => {
+    // Two rounds in flight mint their sequence numbers in call order but deliver
+    // them in completion order, which the platform answers with 300317 and the
+    // write is dropped. Serializing is what keeps arrival order monotonic.
+    assert.equal(st8.maxInFlight, 1, `saw ${st8.maxInFlight} writes in flight at once`)
+    assert.equal(st8.lastStream(ELEMENTS.answer), '第五段')
+  })
+  await sr8.finish('s8', {})
+
+  const st9 = new FlakyTransport()
+  const sr9 = new TurnRenderer({ transport: st9, flushIntervalMs: 10_000 })
+  await sr9.begin('s9', { chatId: 'c9' })
+  sr9.addLiveAnswer('s9', '第六段')
+  const pendingSess9 = sr9.flush('s9')
+  await st9.streamStarted
+  await sr9.finish('s9', { title: '完成' })
+  await pendingSess9
+  await check('the terminal write lands after the writes already in flight', () => {
+    // `finish` turns streaming off, so a streaming write that arrived after it
+    // would be rejected against a card that is no longer streaming.
+    assert.deepEqual(st9.order.slice(-2), [`element:${ELEMENTS.answer}`, 'card'])
+    assert.equal(st9.updates.at(-1).card.config.streaming_mode, false)
+  })
+
+  const stormWarns = []
+  const st10 = new FlakyTransport({ streamErrors: [300309, 300309, 300309, 300309], settingsErrorAfter: 1 })
+  const sr10 = new TurnRenderer({
+    transport: st10,
+    flushIntervalMs: 10_000,
+    logger: { warn: (...args) => stormWarns.push(args) },
+  })
+  await sr10.begin('s10', { chatId: 'c10' })
+  sr10.addLiveAnswer('s10', '第七段')
+  for (let round = 0; round < 8; round++) await sr10.flush('s10')
+  await check('a card whose stream stays closed is not retried every interval', () => {
+    // Production logged 56 consecutive rejections for a single turn, one per
+    // flush, every one of them swallowed the same way.
+    assert.equal(st10.streamCalls, 1, `streamElement called ${st10.streamCalls} times`)
+    assert.ok(stormWarns.length <= 2, `logged ${stormWarns.length} warnings`)
+    assert.match(JSON.stringify(st10.updates.at(-1).card), /第七段/)
+  })
+  await sr10.finish('s10', {})
+
+  await check('a refresh that fails does not take working writes away', async () => {
+    // A failed refresh proves nothing about the session; only a write the
+    // platform refused does. Treating the two alike would drop a live card to
+    // full-card updates on the strength of an unrelated hiccup.
+    const t11 = new FlakyTransport({ settingsErrorAfter: 1 })
+    const r11 = new TurnRenderer({ transport: t11, flushIntervalMs: 10_000, streamRefreshMs: 0 })
+    await r11.begin('s11', { chatId: 'c11' })
+    r11.addLiveAnswer('s11', '第八段')
+    await r11.flush('s11')
+    assert.equal(t11.settingsEnabled.length, 2, 'the refresh was attempted')
+    assert.equal(t11.lastStream(ELEMENTS.answer), '第八段')
+    await r11.finish('s11', {})
+  })
+
+  await check('a standalone decision card is nudged by replacing it, not by streaming', async () => {
+    // The nudge wrote element content to a card whose streaming mode was never
+    // enabled, so it could only ever fail — and invisibly, because the rejection
+    // was swallowed by an empty catch. Replacing the card is the path that works
+    // however long the decision is left unanswered.
+    const source = await readFile(new URL('../index.js', import.meta.url), 'utf8')
+    const nudge = source.slice(source.indexOf('const reminder ='), source.indexOf('reminder?.unref'))
+    assert.ok(nudge.length > 0, 'the reminder block was not found')
+    assert.ok(!nudge.includes('streamElement'), 'the nudge must not stream element content')
+    assert.match(nudge, /transport\s*\.updateCard\(cardId, buildDecisionCard\(/)
+  })
+
+  await check('the real transport tags the platform code on every failure', async () => {
+    // Both failure shapes — the HTTP-level one and the in-band one — must carry
+    // the code, or a closed session reads as an anonymous error at the retry.
+    const transport = await readFile(new URL('../lib/feishu.js', import.meta.url), 'utf8')
+    assert.match(transport, /STREAM_CLOSED_CODES = new Set\(\[200850, 300309\]\)/)
+    assert.match(transport, /error\.code = code/)
+    assert.match(transport, /wrapped\.code = /)
+    assert.match(transport, /wrapped\.streamClosed = true/)
+    assert.match(transport, /export function isStreamingClosed/)
   })
 
   console.log('card creation is race-safe')

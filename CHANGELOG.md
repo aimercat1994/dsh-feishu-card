@@ -800,6 +800,42 @@ if (reply === undefined) {
 
 ---
 
+## 0.3.5
+
+### 修：前台命令被当成后台任务播报，Web 界面驱动会话时每条命令发一张卡片
+
+用户报告：**"我在飞书选择会话并发出消息正常返回卡片信息；后面我切换到 web 界面继续会话，飞书上会发一堆后台任务完成的卡片"**。
+
+原因不在卡片，在"什么算一条要播报的通知"。通知层订阅了作业注册表（`ctx.jobs`），条件只有 `event.type === 'settled'` 一项，于是**每一次结算**都被当成"后台任务完成"发出去。但注册表里装的不只是后台任务——`@deepseek-ai/dsh-tool-bash` 的文档写得很直白："While a job registry is composed, **every call registers its process with `ctx.jobs` as it starts**"，前台调用只是 `await registry.wait(...)` 等它落地而已。**每敲一条命令就是一个 job**，结算一次。
+
+作业记录本身区分不了前台后台（`JobSpec` 只有 kind / label / owner / status…），但**事件里有**：`settled` 携带 `awaited`，含义是"这次结算释放了一个正在等待的 `JobRegistry.wait`"。平台把这个字段的用途写在了两处类型注释里，说的正是本插件该做的事——`dsh-tool-bash`："stay on it until it settles, so the settlement is `awaited` and **no completion notice follows a result this call already carries**"；`dsh-jobs`："**a completion reporter treats an awaited settlement as already delivered and reports only the unawaited ones**"。插件从来没有读这个字段。
+
+为什么在飞书里看不出问题：那种情况下聊天里有一张活着的回合卡，通知以一行落进过程面板；而 **Web 界面驱动的回合不会给飞书建卡**（建卡条件里含 `channelTurns > 0`，只有来自飞书的回合才"欠"一张卡），于是每条命令的结算都变成一张独立卡片，标题正是通知卡的默认 `DSH`。
+
+修：把"该不该播报"收敛成一个纯函数 `jobNoticeOwner(event)`（`lib/notice.js`）——不是 `settled` 不播、`awaited === true` 不播、没有 owner 不播，**只有没人等待过的结算才算新闻**；宿主侧只剩 `const owner = jobNoticeOwner(event)` 一句，再照旧用 `serves()` 过滤会话。顺带的效果：飞书回合的过程面板里也不会再出现"后台任务完成：bash-N · …"这种刚刚在工具结果里看过的行（0.3.4 的 ② 只把它压短了，没有问它该不该存在）。
+
+**断言 283 → 286**（改写 1 条 + 新增 4 条，净 +3）。红/绿实验：把 `awaited` 那一行守卫去掉，正好 2 条红（`only a job nobody waited on is announced`、`a foreground command is not announced a second time`）、其余 284 条不受影响；回补后 286 全绿。
+
+### 修：一整个回合的正文被拼成一大段，读起来没有分段
+
+用户贴了飞书里的原样输出，一句话说完症状：**"回复的时候会回复一大段未分段的文字，阅读性很差"**。那段文字里有一个词是断的——`…into the report.Now the precision pass…`——这就是根因的指纹：两段话之间**一个字符都没有**。
+
+三处都在做"拼接"，而且都没有放分隔符：
+
+- `readAssistantContent()`（`index.js`）：同一条消息里多个同类型 block 直接 `text += block.text`；
+- `commitAssistant()`（`lib/turn.js`）：`state.committedAnswer += text`，**每一步的正文直接接在上一段尾巴上**；
+- `get answer()`：`committedAnswer + liveAnswer`，正在流式的那段同样贴着前面。
+
+会话日志证实了它：那是一个飞书绑定的会话，**每一个 assistant step 各带一个 `text` block**，step 49 是 `The full spec has landed. Final enrichment pass on the report:`、step 56 是 `结论先说：能做。`，两者一接就成了用户看到的那一坨。另外模型自己有时会在段首写 `\n` 或 `\n\n`（那几步确实有一个换行），所以原文里换行是**有的、但没规律**——这正是"看起来像分过段又没分"的来源。
+
+还有一层平台行为值得记下来：**飞书 markdown 元素把孤立的一个 `\n` 当作同一段内的软换行**，只有空行才是真正的分段。所以修法不能只是"补一个换行"，得补空行。
+
+修：`lib/turn.js` 新增 `joinParagraphs(left, right)`——两边都非空时用 `\n\n` 连接，并把右侧开头、左侧结尾多余的换行折掉（模型自己写了 `\n\n` 时不会变成三个）。`commitAssistant()` 用它把每步正文接成一段一段，`get answer()` 用它把"已提交 + 正在流式"接成两段；`readAssistantContent()` 改为同类型 block 之间 `join('\n\n')`，顺带导出它以便断言。
+
+**断言 286 → 291**（+5）。红/绿实验：把上面三处 `joinParagraphs` / `join('\n\n')` 全部退回原样，**6 条红**（`a second step starts its own paragraph`、`the second commit does not double either`、`the terminal render is one card.update carrying everything`、`each step of a turn is its own paragraph`、`several blocks of one message stay separate paragraphs`、`the paragraph break reaches the card, not just the state`），其余 285 条不受影响；回补后 291 全绿。另外两条是**防护性**的（只验证"不会产生 3 个以上连续换行"和"状态到卡片的传导"），在未修复的代码上本来就通过，所以不计入这次的红。
+
+---
+
 ## 0.3.4
 
 ### 修：三处"卡片上读不出发生了什么"的呈现问题
@@ -855,3 +891,5 @@ if (reply === undefined) {
 - ⑥ 的修复**已实测**：重启后再委派一个后台子代理，聊天里只建出**一张**名册卡（`🤖 子代理 0/1` 建于 19:26:28，`started …` 的改写落在 19:26:29 的同一张卡上，结算通知到后 19:26:46 变成 `1/1`），没有双胞胎
 - ⑤⑥ 都验完了，但"真实卡片上的行文本"依然读不出来（v2 卡片正文只返回"请升级至最新版本客户端"），所以每行的标记仍只有离线断言 + 肉眼确认
 - 实测 ⑤ 时留下的那张"双胞胎"卡（`om_x100b6394534ca4acc2e248b3ea9fa62`）仍停在 `0/1`，需要人工删除——插件没有删除聊天消息的接口
+- 0.3.5 的 `awaited` 过滤只有离线断言 + 红线实验，**真实卡片上还没复测**：需要重启 `dsh web` 让宿主侧改动生效，然后在 Web 界面继续一个绑定到飞书的会话（正是用户报的场景），观察聊天里是否还在持续新增标题为 `DSH` 的卡片——预期一条都不再新增
+- 反面同样要测：重启后用一次 `run_in_background` 的 bash 造一个**真正**的后台任务，确认它落地时仍然会通知（否则就成了"把噪音关掉、把功能也关掉"）

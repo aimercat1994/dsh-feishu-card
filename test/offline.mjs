@@ -28,6 +28,7 @@ import {
   invalidElementIds,
   settledDecisionElements,
 } from '../lib/card.js'
+import { readAssistantContent } from '../index.js'
 import { MAX_WRITE_FAILURES, STREAM_REFRESH_MS, TurnRenderer } from '../lib/turn.js'
 import { ConversationSessions, conversationKey, makeWorkspaceFiler, sessionIdFor } from '../lib/session.js'
 import { DESTRUCTIVE_COMMANDS, buildHelpCard, isDestructive } from '../lib/help-card.js'
@@ -59,7 +60,7 @@ import {
 import { describeCall, describeDiff, formatTokens, kindOf } from '../lib/present.js'
 import { REACTION, ReactionTracker } from '../lib/react.js'
 import { FeishuTransport, STREAM_CLOSED_CODES, isStreamingClosed } from '../lib/feishu.js'
-import { Notices, compactionFailedLine, jobLine, pressureLine, retryLine } from '../lib/notice.js'
+import { Notices, compactionFailedLine, jobLine, jobNoticeOwner, pressureLine, retryLine } from '../lib/notice.js'
 import { PROGRESS_ELEMENTS, ProgressCards, goalCard, subagentCard, todoCard } from '../lib/progress.js'
 import { SubagentRoster, childIdIn, settlementOutcome } from '../lib/subagents.js'
 import {
@@ -393,13 +394,13 @@ async function main() {
   renderer.resetLive('s1')
   renderer.addLiveAnswer('s1', '世界')
   await settle()
-  await check('a second step appends to the committed text', () => {
-    assert.equal(renderer.get('s1').answer, '你好世界')
+  await check('a second step starts its own paragraph', () => {
+    assert.equal(renderer.get('s1').answer, '你好\n\n世界')
   })
   renderer.commitAssistant('s1', { text: '世界' })
   await settle()
   await check('the second commit does not double either', () => {
-    assert.equal(renderer.get('s1').answer, '你好世界')
+    assert.equal(renderer.get('s1').answer, '你好\n\n世界')
   })
 
   await check('activity lines accumulate', () => {
@@ -414,7 +415,7 @@ async function main() {
     const final = transport.updates[0].card
     const answer = final.body.elements.find((e) => e.element_id === ELEMENTS.answer)
     const footer = final.body.elements.find((e) => e.element_id === ELEMENTS.footer)
-    assert.equal(answer.content, '你好世界')
+    assert.equal(answer.content, '你好\n\n世界')
     assert.equal(footer.content, '⏱ 1.0s')
     assert.equal(final.header.title.content, 'DSH · 已完成')
     assert.equal(final.header.template, TEMPLATE.done)
@@ -423,6 +424,51 @@ async function main() {
     assert.equal(transport.updates[0].card.config.streaming_mode, false)
     assert.deepEqual(transport.released, ['card_1'])
     assert.equal(renderer.has('s1'), false)
+  })
+
+  console.log('paragraphs in the answer body')
+  const tPara = new FakeTransport()
+  const rPara = new TurnRenderer({ transport: tPara, flushIntervalMs: 5 })
+  await rPara.begin('sp1', { chatId: 'cp1' })
+  rPara.commitAssistant('sp1', { text: 'The full spec has landed. Final enrichment pass on the report:', reasoning: 'a' })
+  rPara.commitAssistant('sp1', { text: '\u7ed3\u8bba\u5148\u8bf4\uff1a\u80fd\u505a\u3002', reasoning: 'b' })
+  await settle()
+  await check('each step of a turn is its own paragraph', () => {
+    // Two steps used to be appended raw, so the end of one and the head of the
+    // next met mid-word ("...into the report.Now the precision pass...").
+    assert.equal(
+      rPara.get('sp1').answer,
+      'The full spec has landed. Final enrichment pass on the report:\n\n\u7ed3\u8bba\u5148\u8bf4\uff1a\u80fd\u505a\u3002',
+    )
+  })
+  await check('several blocks of one message stay separate paragraphs', () => {
+    const read = readAssistantContent({
+      content: [
+        { type: 'reasoning', text: 'first thought' },
+        { type: 'text', text: 'into the report.' },
+        { type: 'text', text: 'Now the precision pass.' },
+        { type: 'reasoning', text: 'second thought' },
+      ],
+    })
+    assert.equal(read.text, 'into the report.\n\nNow the precision pass.')
+    assert.equal(read.reasoning, 'first thought\n\nsecond thought')
+  })
+  await check('a step that already opens with newlines does not gain more', () => {
+    // Real steps in the octop turn began with "\n" or "\n\n" of their own, so a
+    // naive join produced three or four newlines.
+    rPara.commitAssistant('sp1', { text: '\n\n\u672c profile \u6ca1\u88c5 interconnect\u3002' })
+    const answer = rPara.get('sp1').answer
+    assert.ok(!/\n{3,}/.test(answer), JSON.stringify(answer))
+    assert.match(answer, /\u80fd\u505a\u3002\n\n\u672c profile \u6ca1\u88c5 interconnect\u3002/)
+  })
+  await check('the paragraph break reaches the card, not just the state', () => {
+    assert.match(tPara.lastStream(ELEMENTS.answer), /report:\n\n\u7ed3\u8bba\u5148\u8bf4/)
+  })
+  const paraExpected = rPara.get('sp1').answer
+  await rPara.finish('sp1', {})
+  await check('the settled card keeps the paragraph breaks', () => {
+    const answer = tPara.updates.at(-1).card.body.elements.find((e) => e.element_id === ELEMENTS.answer)
+    assert.equal(answer.content, paraExpected)
   })
 
   console.log('numbered thinking and a separated tool timeline')
@@ -1222,10 +1268,40 @@ async function main() {
     assert.equal(h.sent.length, 1, 'it must still reach the user')
   })
 
-  await check('a job with no owner is not announced', async () => {
+  await check('only a job nobody waited on is announced', () => {
+    const settled = (extra) => ({ type: 'settled', awaited: false, job: { owner: 's' }, ...extra })
+    assert.equal(jobNoticeOwner(settled({})), 's')
+    // A call that waited on the job already carries its outcome.
+    assert.equal(jobNoticeOwner(settled({ awaited: true })), undefined)
+    // Not a settlement at all.
+    assert.equal(jobNoticeOwner({ type: 'registered', awaited: false, job: { owner: 's' } }), undefined)
+    assert.equal(jobNoticeOwner({ type: 'output', owner: 's', total: 3 }), undefined)
+    // An unowned job has nowhere to be announced, and a missing event is not one.
+    assert.equal(jobNoticeOwner(settled({ job: {} })), undefined)
+    assert.equal(jobNoticeOwner(undefined), undefined)
+  })
+  await check('a foreground command is not announced a second time', async () => {
+    // Every command the bash tool runs is registered as a job, so a foreground
+    // command settles as one too — `awaited`, because the call waited on it and
+    // already returned the outcome. Announcing those made the Web GUI driving a
+    // chat-bound session send one card per command.
+    const h = noticeHarness({ live: false })
+    await h.notices.jobSettled({ type: 'settled', awaited: true, job: { id: 'bash-1', owner: 's', status: 'completed', label: 'ls' } })
+    assert.equal(h.sent.length, 0, 'the tool result already said so')
+    await h.notices.jobSettled({ type: 'settled', awaited: false, job: { id: 'bash-2', owner: 's', status: 'completed', label: 'build' } })
+    assert.equal(h.sent.length, 1, 'a job really running in the background still reaches the chat')
+    assert.equal(h.sent[0].body.elements[0].content.includes('后台任务完成'), true)
+  })
+  await check('a background job settling inside a turn still joins the panel', async () => {
     const h = noticeHarness({ live: true })
-    await h.notices.jobSettled({ status: 'completed', label: 'x' })
-    assert.equal(h.activity.length, 0)
+    await h.notices.jobSettled({ type: 'settled', awaited: false, job: { id: 'bash-3', owner: 's', status: 'failed', label: 'test' } })
+    assert.equal(h.sent.length, 0, 'no extra message while a card is live')
+    assert.match(h.activity[0], /后台任务失败/)
+  })
+  await check('the host lets the registry decide whether a settlement was awaited', async () => {
+    const source = await readFile(new URL('../index.js', import.meta.url), 'utf8')
+    assert.match(source, /const owner = jobNoticeOwner\(event\)/)
+    assert.match(source, /void notices\.jobSettled\(event\)/)
   })
 
   console.log('progress cards')

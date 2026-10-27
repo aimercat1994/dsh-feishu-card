@@ -49,7 +49,7 @@ lib/
   access.js           入站准入：谁可以开对话、为什么被丢弃（纯函数）
   log.js              控制台 + 落盘双写日志
 client/client.js     浏览器一半：插件管理页里的配置表单（手写、免构建）
-test/offline.mjs      283 项离线断言
+test/offline.mjs      291 项离线断言
 ```
 
 **职责边界**（改动时请维持）：
@@ -81,7 +81,7 @@ test/offline.mjs      283 项离线断言
 | `commands` | 可选 `ctx.get` | 斜杠命令委派 |
 | `goals` | 可选 | goal 卡片的暂停/继续/清除 |
 | `agents` | 可选 | 从 sessionId 找 agent（goal 操作需要） |
-| `jobs` | 可选 | `jobs.events.subscribe` 后台任务完成 |
+| `jobs` | 可选 | `jobs.events.subscribe` 后台任务完成；只播报 `awaited === false` 的结算 |
 | `tools` | 可选 | 在 agent ctx 上注册 `denyTools` guard |
 | `workspaceRegistry` | 可选 | 解析默认 `cwd` |
 
@@ -235,11 +235,13 @@ session/event: user/message  （source.kind === 'subagent-settled'）
 | **元素写入失败必须降级，不能放弃整张卡** | `card.update` 不依赖流式模式；放弃等于让用户盯着不动的卡 |
 | **不写空内容、不写未变化的内容** | 空内容写入被平台拒绝（HTTP 400）；重复写浪费 sequence |
 | **一行叙述必须读出"这一笔在做什么"** | `targetOf()` 的键表漏了工具真正传的键（`url`/`name`）时，用户看到的就是一个光秃秃的工具名 |
+| **相邻两步的正文之间必须是空行，不能硬拼** | 每个 assistant step 各带一段正文；`committedAnswer += text` 会把两句黏成一个词（`…the report.Now the precision pass…`），而飞书 markdown 把孤立的一个 `\n` 当同段软换行，只有空行才是分段 |
 | **过程面板里的两股内容必须靠编号或标题分开** | 思考与工具相邻堆放时，多段思考读起来是连续一段，分不清哪句属于哪一步 |
 | **一张进度卡在同一时刻只能有一个写入在飞** | 建卡要一次往返，而喂卡的事件常常比它更快（`tool/call` 建卡、48 毫秒后 `started …` 的结果就要改写它）；没有这条，第二份快照会在第一张卡还没拿到 id 时再建一张，双胞胎里那张永远停在第一帧 |
 | **子代理名册只由被服务会话自己的事件建立** | 子代理自己的会话不在这里服务（`subagent/descriptor` 一律被 `serves()` 挡掉），host 的 `subagent/start\|end` 又不带委派会话；可用的是本会话的 `tool/call` + `tool/result`、父会话持有的 `subagent/catalog`，以及子代理结束时发到这里的 `subagent-settled` 通知 |
 | **结果以 `started` 开头的委派不算完成** | 后台/可续跑的子代理在子代理仍在跑时就返回；标成完成是这张卡永远无法纠正的谎 |
 | **子代理的结局只由平台的结算通知判定，读不懂的句式判失败** | 只有 `finished and will do no further work` 是成功；把"没读懂的结尾"当成功，等于让卡片替平台宣布一件它并不知道的事 |
+| **只播报没人等待过的作业结算（`awaited === false`）** | 注册表里**每一条前台命令也是一个 job**（bash 工具每次调用都注册），而 `awaited` 正是平台用来标记"这次结算已经有调用方收下结果"的字段；不读它，就没有办法把"后台任务完成"和"刚才那条命令的结果"分开，Web 界面驱动会话时每条命令都会变成一张卡片 |
 | **头部/决策块变化必须走整卡 `card.update`** | 它们不是可寻址元素，元素写入够不到 |
 | **waterfall 里的纯观察者必须 `next()`** | 不交还会吞掉宿主或其他插件的处理 |
 | **叙述/通知的格式化失败不能抛** | 叙述出错不该毁掉一个正在跑的回合（都包了 try/catch） |
@@ -256,6 +258,9 @@ session/event: user/message  （source.kind === 'subagent-settled'）
 
 **为什么过程面板里要给思考编号、给工具时间线加标题**
 面板里两股内容的语义完全不同：`reasoning` 是模型对**当前这一步**的想法，`activity` 是**这一步做了什么**。原先两者直接相邻堆放，一个回合里有几段思考就糊成连续一大段——读者分不清哪句话属于哪一步。现在每段思考带 `**思考N**`（`numberedReasoning()` 连续编号、空段跳过，**进行中的那段也带编号**，所以它落定时编号不会变），工具时间线整体带 `**工具调用**` 前缀，两者之间插一个恒存在的 `hr`（`ELEMENTS.processSep`）。刻意用**恒存在**的元素而不是按需插入：流式期间节点位置一变，客户端布局就跳。标题在 `#elementContent`（流式元素写）和 `document()`（终态整卡写）**两处都套**，否则面板会在"流式中"和"终态"之间换脸。
+
+**为什么招式正文按步分段（`joinParagraphs`）**
+一个回合是若干 assistant step 串起来的，每个 step 各带自己的 `text` block——`readAssistantContent()` 读它，`commitAssistant()` 累积它，`get answer()` 再并上正在流式的那段。三处原先都用 `+` 直接拼，于是上一步的结尾和下一步的开头之间**一个字符都没有**。会话日志里的指纹很明确：step 49 以 `…on the report:` 结束、step 56 以 `结论先说：` 开头，接起来就是 `report:结论先说：`。更麻烦的是模型自己有时会在段首写 `\n` 或 `\n\n`，所以原文里换行**有、但没规律**，看起来像分了段又没分。`joinParagraphs()` 统一成空行连接，并折掉两边多余的换行（模型自己写了两个时不会变三个）；平台这一侧则是：飞书 markdown 的孤立 `\n` 只是软换行，**空行**才是真正的段落边界。
 
 **为什么工具行必须自带内容，后台任务的 label 必须压缩**
 一行叙述的价值全在"这一笔在做什么"：`🔧 \`compress\`` 与 `🗜️ \`compress\` 4 段 · m00001–m00004 会话背景` 差着一次点击。所以 `targetOf()` 的键表要覆盖各工具**真正传参**的键（`url`、`name`…），没有路径也没有命令的工具（`compress`）要有自己的分支 `compressedRanges()`。同理，`job.label` 是**整条 shell 命令**——它适合日志，不适合卡片；`jobLine()` 把它压成单行 ≤80 字符并前缀任务 id。
@@ -284,7 +289,7 @@ session/event: user/message  （source.kind === 'subagent-settled'）
 
 **加一个卡片元素**：在 `ELEMENTS` 加 id（**只能用字母数字下划线、首字母、≤20**），在构造器里放进去，`invalidElementIds` 断言会自动校验。若需要流式写入，确保 `turn.js` 的 `#elementContent` 认识它。
 
-**加一个通知源**：在 `notice.js` 加一个纯格式化函数（可离线测试），在 `Notices` 加一个方法，在 `index.js` 接线。注意区分"回合内进面板"与"回合外发卡"。
+**加一个通知源**：在 `notice.js` 加一个纯格式化函数（可离线测试），在 `Notices` 加一个方法，在 `index.js` 接线。注意区分"回合内进面板"与"回合外发卡"，并先想清楚**它该不该播报**——作业类的信号必须过 `jobNoticeOwner()` 的 `awaited` 过滤，否则会把"已经被工具结果收下的东西"再播一遍。
 
 **改设置表单**：宿主侧只改 `lib/config.js`（`.description()` 就是表单里的说明）；表单本身在 `client/client.js` 的 `GROUPS` 里维护，**两处都要加**——schema 是校验契约，`GROUPS` 是给人看的。字段名两边必须一致。
 

@@ -34,7 +34,7 @@ import {
 } from './lib/commands.js'
 import { createLogger } from './lib/log.js'
 import { ReactionTracker } from './lib/react.js'
-import { Notices } from './lib/notice.js'
+import { Notices, jobNoticeOwner } from './lib/notice.js'
 import { ProgressCards } from './lib/progress.js'
 import { Fanout } from './lib/fanout.js'
 import { SubagentRoster } from './lib/subagents.js'
@@ -101,15 +101,21 @@ function stripMentionPlaceholders(text) {
   return text.replace(/@_\w+\s*/g, '').trim()
 }
 
-/** Text and reasoning carried by one committed assistant message. */
-function readAssistantContent(message) {
-  let text = ''
-  let reasoning = ''
+/**
+ * Text and reasoning carried by one committed assistant message.
+ *
+ * Several blocks of the same kind are separate paragraphs, not one sentence cut
+ * in half, so they are joined with a blank line: gluing them with nothing put
+ * "…into the report." and "Now the precision pass…" together as one word.
+ */
+export function readAssistantContent(message) {
+  const texts = []
+  const thoughts = []
   for (const block of message?.content ?? []) {
-    if (block?.type === 'text') text += block.text ?? ''
-    else if (block?.type === 'reasoning') reasoning += block.text ?? ''
+    if (block?.type === 'text') texts.push(block.text ?? '')
+    else if (block?.type === 'reasoning') thoughts.push(block.text ?? '')
   }
-  return { text, reasoning }
+  return { text: texts.filter((part) => part !== '').join('\n\n'), reasoning: thoughts.filter((part) => part !== '').join('\n\n') }
 }
 
 /**
@@ -1132,13 +1138,19 @@ export async function apply(ctx, config = {}) {
 
     // Background jobs settle outside any turn, so this is the only way a chat
     // learns that one finished.
+    //
+    // A foreground command is a job too — every command the bash tool runs is
+    // registered — but its settlement is `awaited`: the call waited on it and
+    // already carries the outcome, so announcing it would repeat the transcript
+    // and, with no turn card open to absorb the line, become one card per
+    // command. `jobNoticeOwner` holds that rule; this is where the session the
+    // notice belongs to is checked against what the profile serves.
     try {
       const jobs = ctx.get('jobs')
       if (jobs?.events?.subscribe) {
         const disposer = jobs.events.subscribe({ owners: 'all' }, (event) => {
-          if (event?.type !== 'settled') return
-          const sessionId = event.job?.owner
-          if (sessionId && sessions.serves(sessionId)) void notices.jobSettled(event.job)
+          const owner = jobNoticeOwner(event)
+          if (owner && sessions.serves(owner)) void notices.jobSettled(event)
         })
         ctx.effect(() => () => disposer())
       }
